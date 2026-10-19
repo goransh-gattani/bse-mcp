@@ -38,6 +38,8 @@ powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/gor
 
 It installs [uv](https://docs.astral.sh/uv/) if needed (uv brings its own Python, so an old system Python doesn't matter), installs bse-mcp, checks that BSE answers from your network, and adds a `bse` entry to Claude Desktop's config without touching your other servers (the previous file is kept as `.bak`). Then quit Claude Desktop completely and reopen it. Re-run the same command to upgrade.
 
+Prefer double-clicking? Download [Connect-BSE-to-Claude.zip](https://github.com/goransh-gattani/bse-mcp/raw/main/Connect-BSE-to-Claude.zip), unzip it, and double-click **Connect BSE to Claude** (`.command` on Mac, `.bat` on Windows). It runs the same installer and then restarts Claude Desktop for you. The first time, macOS asks you to right-click → Open, and Windows SmartScreen may need "More info → Run anyway", because the files aren't code-signed.
+
 Already installed bse-mcp another way? `bse-mcp setup` does just the registration step.
 
 **By hand**, if you prefer:

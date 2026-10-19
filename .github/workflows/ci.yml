@@ -65,3 +65,26 @@ jobs:
           $c | ConvertTo-Json
           if (-not $c.other) { throw "other server lost" }
           if (-not (Test-Path $c.bse.command)) { throw "bse command missing: $($c.bse.command)" }
+  double-click-files:
+    # The "Connect BSE to Claude" files fetch install.sh / install.ps1 from main, so this checks the
+    # published path end to end. No Claude Desktop on the runner: the files must say so and still succeed.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - if: runner.os == 'macOS'
+        run: printf '\n\n' | sh "connect/Connect BSE to Claude.command"
+      - if: runner.os == 'macOS'
+        run: python3 -c "import json,os; c=json.load(open(os.path.expanduser('~/Library/Application Support/Claude/claude_desktop_config.json'))); print(c); assert os.access(c['mcpServers']['bse']['command'], os.X_OK)"
+      - if: runner.os == 'Windows'
+        shell: cmd
+        run: echo.| "connect\Connect BSE to Claude.bat"
+      - if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $c = (Get-Content "$env:APPDATA\Claude\claude_desktop_config.json" -Raw | ConvertFrom-Json).mcpServers
+          $c | ConvertTo-Json
+          if (-not (Test-Path $c.bse.command)) { throw "bse command missing" }
