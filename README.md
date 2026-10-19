@@ -24,9 +24,16 @@ BSE blocks most datacenter IPs, so the server runs where BSE will answer: on you
 
 ### Claude Desktop or Claude Code, on your computer (most reliable)
 
+Needs Python 3.10+. macOS's built-in Python is 3.9, so the simplest route is [uv](https://docs.astral.sh/uv/), which fetches a recent Python just for this tool:
+
 ```bash
-pip install "bse-mcp[chrome]"      # [chrome] adds curl_cffi, which makes BSE far less likely to refuse
+curl -LsSf https://astral.sh/uv/install.sh | sh                 # once; then reopen the terminal
+uv tool install --python 3.12 "bse-mcp[chrome] @ git+https://github.com/goransh-gattani/bse-mcp"
+bse-mcp --diag                                                  # should show HTTP 200
+which bse-mcp                                                   # full path, for the config below
 ```
+
+With Python 3.10+ already installed, `pip install "bse-mcp[chrome] @ git+https://github.com/goransh-gattani/bse-mcp"` works too (`pip install "bse-mcp[chrome]"` once it is on PyPI). `[chrome]` adds curl_cffi, which makes BSE far less likely to refuse.
 
 Claude Code:
 
@@ -34,10 +41,10 @@ Claude Code:
 claude mcp add bse -- bse-mcp
 ```
 
-Claude Desktop: Settings → Developer → Edit Config, add the server, restart the app:
+Claude Desktop: Settings → Developer → Edit Config, add the server with the full path from `which bse-mcp` (the app doesn't see your terminal's PATH), then quit (⌘Q) and reopen the app:
 
 ```json
-{ "mcpServers": { "bse": { "command": "bse-mcp" } } }
+{ "mcpServers": { "bse": { "command": "/Users/you/.local/bin/bse-mcp" } } }
 ```
 
 `uvx` works too: `"command": "uvx", "args": ["--from", "bse-mcp[chrome]", "bse-mcp"]`.
