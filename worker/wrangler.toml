@@ -1,0 +1,9 @@
+# Deploy your own copy:  npx wrangler deploy   (from this folder, after `npx wrangler login`)
+# or the "Deploy to Cloudflare" button in the README.
+name = "bse-mcp"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+# [vars]
+# MCP_TOKEN = "change-me"      # require "Authorization: Bearer <token>" on /mcp
+# ALLOWED_ORIGIN = "https://example.com"
