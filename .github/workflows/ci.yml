@@ -23,3 +23,45 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "22" }
       - run: node --test worker/test/worker.test.mjs
+  installer:
+    # Runs the real one-line installers against this checkout on fresh machines. BSE usually blocks
+    # GitHub's datacenter IPs, so the BSE check is expected to warn here; everything else must pass.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pre-existing Claude Desktop config with another server
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then d="$HOME/Library/Application Support/Claude"; else d="$HOME/.config/Claude"; fi
+          mkdir -p "$d" && echo '{"mcpServers":{"other":{"command":"x"}}}' > "$d/claude_desktop_config.json"
+          echo "CFG=$d/claude_desktop_config.json" >> "$GITHUB_ENV"
+      - run: sh install.sh
+        env: { BSE_MCP_SOURCE: "${{ github.workspace }}" }
+      - name: Config has both servers, bse points at a real executable
+        run: |
+          python3 -c "import json,os,sys; c=json.load(open(os.environ['CFG']))['mcpServers']; print(c); assert 'other' in c and os.access(c['bse']['command'], os.X_OK)"
+      - name: Re-running is safe
+        run: sh install.sh
+        env: { BSE_MCP_SOURCE: "${{ github.workspace }}" }
+  installer-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pre-existing Claude Desktop config with another server
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:APPDATA\Claude" | Out-Null
+          '{"mcpServers":{"other":{"command":"x"}}}' | Set-Content "$env:APPDATA\Claude\claude_desktop_config.json"
+      - shell: pwsh
+        run: ./install.ps1
+        env: { BSE_MCP_SOURCE: "${{ github.workspace }}" }
+      - name: Config has both servers, bse points at a real file
+        shell: pwsh
+        run: |
+          $c = (Get-Content "$env:APPDATA\Claude\claude_desktop_config.json" -Raw | ConvertFrom-Json).mcpServers
+          $c | ConvertTo-Json
+          if (-not $c.other) { throw "other server lost" }
+          if (-not (Test-Path $c.bse.command)) { throw "bse command missing: $($c.bse.command)" }

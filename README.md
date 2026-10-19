@@ -24,6 +24,24 @@ BSE blocks most datacenter IPs, so the server runs where BSE will answer: on you
 
 ### Claude Desktop or Claude Code, on your computer (most reliable)
 
+**One command** installs everything and registers the server with Claude Desktop (and Claude Code, if you have it):
+
+```bash
+# macOS / Linux
+curl -LsSf https://raw.githubusercontent.com/goransh-gattani/bse-mcp/main/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/goransh-gattani/bse-mcp/main/install.ps1 | iex"
+```
+
+It installs [uv](https://docs.astral.sh/uv/) if needed (uv brings its own Python, so an old system Python doesn't matter), installs bse-mcp, checks that BSE answers from your network, and adds a `bse` entry to Claude Desktop's config without touching your other servers (the previous file is kept as `.bak`). Then quit Claude Desktop completely and reopen it. Re-run the same command to upgrade.
+
+Already installed bse-mcp another way? `bse-mcp setup` does just the registration step.
+
+**By hand**, if you prefer:
+
 Needs Python 3.10+. macOS's built-in Python is 3.9, so the simplest route is [uv](https://docs.astral.sh/uv/), which fetches a recent Python just for this tool:
 
 ```bash

@@ -85,12 +85,26 @@ for _fn in (tools.search_scrips, tools.get_quote, tools.get_market_depth, tools.
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="bse-mcp", description="MCP server for live BSE India data (unofficial).")
+    parser = argparse.ArgumentParser(prog="bse-mcp", description="MCP server for live BSE India data (unofficial). "
+                                     "With no command it runs the server over stdio, which is what Claude launches.")
     parser.add_argument("--version", action="version", version=f"bse-mcp {__version__}")
     parser.add_argument("--diag", action="store_true", help="try every way of reaching BSE from this network, print the results, and exit")
+    sub = parser.add_subparsers(dest="cmd")
+    setup = sub.add_parser("setup", help="register this server with Claude Desktop and Claude Code")
+    setup.add_argument("--no-desktop", action="store_true", help="don't touch the Claude Desktop config")
+    setup.add_argument("--no-code", action="store_true", help="don't register with Claude Code")
     args = parser.parse_args(argv)
     if args.diag:
         print(bse.diagnose())
+        return 0
+    if args.cmd == "setup":
+        from . import setup_claude
+        try:
+            for line in setup_claude.run(desktop=not args.no_desktop, code=not args.no_code):
+                print(line)
+        except setup_claude.SetupError as exc:
+            print(f"bse-mcp setup: {exc}", file=sys.stderr)
+            return 1
         return 0
     server.run()
     return 0
