@@ -34,6 +34,8 @@ class FakeBse:
             return body if isinstance(body, str) else json.dumps(body)  # BSE double-encodes this one
         if name == "Corp_detailedResult_Transpose_ng":
             return F.detail(q["Qtr"])
+        if name == "StockReachGraphCas" and q.get("flag") == "12M":
+            return F.HIST_12M
         if name == "AnnSubCategoryGetData":
             rows = F.ANN if q["strCat"] == "-1" else [r for r in F.ANN if r["CATEGORYNAME"] == "Result"]
             page = int(q["pageno"])

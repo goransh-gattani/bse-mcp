@@ -47,6 +47,17 @@ for i in range(30):
     mm = 540 + i * 5
     pts.append({"dttm": f"Mon Oct 12 2026 {mm // 60:02d}:{mm % 60:02d}:44", ("vale0" if i == 0 else "vale1"): f"{6950 + (i % 7) * 4 + i:.2f}", "vole": "0"})
 
+# StockReachGraphCas with flag=12M: one point per trading day, in the format seen live (ABB, Oct 2026).
+HIST = []
+_day = __import__("datetime").date(2025, 10, 21)
+while len(HIST) < 250:
+    if _day.weekday() < 5:
+        HIST.append({"dttm": _day.strftime("%a %b %d %Y 00:00:00"), "vole": str(2000 + 37 * len(HIST) % 900),
+                     "vale1": f"{5200 + 6 * len(HIST) + 40 * ((len(HIST) % 10) - 5):.2f}"})
+    _day += __import__("datetime").timedelta(days=1)
+HIST_12M = {"CurrDate": "Mon Oct 19 2026 00:00:00", "CurrTime": "00:00", "CurrVal": HIST[-1]["vale1"], "Data": json.dumps(HIST),
+            "HighVal": "8000", "LowVal": "4000", "PrevClose": "0", "Scripname": "ABB"}
+
 RESULTS_FIX = {"col1": "(in Cr.)", "col2": "Jun-26", "col3": "Mar-26", "col4": "FY25-25",
                "resultinCr": [{"title": "Revenue", "v1": "3,558.87", "v2": "3,184.06", "v3": "13,202.73"}, {"title": "Net Profit", "v1": "362.30", "v2": "1,783.65", "v3": "1,668.26"}],
                "resultinS": [{"FY": "FY25-25", "LQ": "Jun-26", "SQ": "Mar-26", "LFY": "https://www.bseindia.com/corporates/results.aspx?Code=500002&Company=ABB-India-Ltd&qtr=128.50&RType=",

@@ -1,5 +1,6 @@
 """Formulas checked against independent references, and the fundamentals pipeline on recorded BSE data."""
 import math
+from datetime import date, timedelta
 
 import pytest
 
@@ -25,6 +26,15 @@ def test_ema_and_macd_exact_on_a_straight_line():
     t = A.technicals(line)
     assert t["macd"]["macd"] == pytest.approx(7.0) and t["macd"]["signal"] == pytest.approx(7.0) and abs(t["macd"]["histogram"]) < 1e-9
     assert t["rsi_14"] == 100.0 and t["trend"]["state"].startswith("golden")
+    assert t["ema"]["ema_50"] == 250 - 24.5
+
+
+def test_price_jumps_flag_possible_unadjusted_splits():
+    dates = [(date(2026, 1, 1) + timedelta(days=i)).isoformat() for i in range(40)]
+    t = A.technicals([100.0] * 20 + [50.0] * 20, dates)  # a 1:1 bonus or 2-for-1 split, unadjusted
+    assert t["price_jumps"]["bars"] == [{"at": dates[20], "change": -0.5}] and "split or bonus" in t["price_jumps"]["note"]
+    assert A.technicals([100.0] * 20 + [50.0] * 20, dates, timeframe="weekly")["price_jumps"]["bars"][0]["at"] == dates[20]
+    assert "price_jumps" not in A.technicals([float(i) for i in range(101, 251)])
 
 
 def test_bollinger_uses_population_sd():
@@ -103,3 +113,99 @@ def test_ttm_needs_four_consecutive_quarters(fake):
     a = tools.analyze_fundamentals("500002", quarters=2)
     assert a["ttm"]["available"] is False and "4 consecutive" in a["ttm"]["reason"]
     assert a["valuation"]["available"] is False
+
+
+# ---- OHLC indicators, each against a value worked out by hand
+def _rising(n=60):
+    c = [100.0 + i for i in range(n)]
+    return [x + 1 for x in c], [x - 1 for x in c], c  # highs, lows, closes
+
+
+def test_atr_true_range_and_gaps():
+    h, l, c = [101.0] * 30, [99.0] * 30, [100.0] * 30
+    assert A.atr(h, l, c) == pytest.approx(2.0)
+    assert A.true_ranges([101, 111], [99, 109], [100, 110]) == [2, 11]  # gap up: high - previous close
+
+
+def test_adx_is_100_in_a_perfectly_steady_uptrend():
+    h, l, c = _rising()
+    d = A.adx(h, l, c)
+    assert (d["adx"], d["plus_di"], d["minus_di"]) == (100.0, 50.0, 0.0) and d["strength"] == "trending" and d["direction"].startswith("up")
+    assert A.adx(h[:27], l[:27], c[:27]) is None  # needs 2 x 14 bars
+
+
+def test_stochastic_and_pivots():
+    h, l, c = _rising()
+    assert A.stochastic(h, l, c) == {"k": round(14 / 15 * 100, 2), "d": round(14 / 15 * 100, 2)}
+    t = A.technicals([100.0] * 29 + [105.0], highs=[101.0] * 29 + [110.0], lows=[99.0] * 29 + [100.0])
+    assert t["pivots_classic"] == {"P": 105.0, "R1": 110.0, "S1": 100.0, "R2": 115.0, "S2": 95.0, "R3": 120.0, "S3": 90.0}
+
+
+def test_swings_and_fibonacci():
+    s = A.swings([1, 2, 5, 2, 1, 2, 6, 2, 1], [1, 2, 5, 2, 1, 2, 6, 2, 1])
+    assert [p["price"] for p in s["highs"]] == [5, 6] and [p["price"] for p in s["lows"]] == [1]
+    h = [150.0, 120.0, 100.0, 140.0, 200.0, 180.0]
+    f = A.fibonacci(h, h, 180.0)
+    assert f["move"] == "up" and f["retracements"]["61.8%"] == 138.2 and f["retracements"]["50%"] == 150.0
+    assert f["extensions"]["161.8%"] == 261.8 and f["extensions"]["200%"] == 300.0 and f["retraced_so_far"] == 0.2
+    # pullback to 180 after the 200 high: C-based projections = 180 + 100 x ratio
+    assert f["pullback"]["price"] == 180.0 and f["pullback"]["projections"] == {"100%": 280.0, "127.2%": 307.2, "161.8%": 341.8, "200%": 380.0}
+    down = A.fibonacci([200.0, 150.0, 100.0], [200.0, 150.0, 100.0], 120.0)
+    assert down["move"] == "down" and down["retracements"]["38.2%"] == 138.2
+
+
+def _bullish_divergence_series():
+    c = [100.0 + (i % 2) for i in range(20)]
+    for _ in range(8):
+        c.append(c[-1] - 3)          # fast drop to a first low (77)
+    for _ in range(8):
+        c.append(c[-1] + 2)
+    while c[-1] > 78:
+        c += [c[-1] - 3, c[-1] - 1]  # gentle zigzag down
+    c.append(c[-1] - 3)              # lower second low (75), with far less selling pressure
+    return c + [c[-1] + 3, c[-1] + 6]
+
+
+def test_rsi_divergence_regular_bullish():
+    c = _bullish_divergence_series()
+    d = A.rsi_divergence(c, c, c)
+    assert len(d) == 1 and d[0]["type"] == "regular bullish"
+    (a, b) = d[0]["points"]
+    assert b["price"] < a["price"] and b["rsi"] > a["rsi"]
+    assert A.rsi_divergence([float(x) for x in range(1, 80)], [float(x) for x in range(1, 80)], [float(x) for x in range(1, 80)]) == []
+
+
+def test_weekly_resampling():
+    days = ["2026-01-05", "2026-01-06", "2026-01-09", "2026-01-12", "2026-01-16", "2026-01-19"]  # Mon..Fri, Mon, Fri, Mon
+    w = A.to_weekly(days, [10, 12, 11, 13, 14, 15], [11, 15, 12, 14, 16, 15], [9, 11, 10, 12, 13, 14], [1, 2, 3, 4, 5, 6])
+    assert w == {"dates": ["2026-01-09", "2026-01-16", "2026-01-19"], "closes": [11, 14, 15], "highs": [15, 16, 15],
+                 "lows": [9, 12, 14], "volumes": [6, 9, 6]}
+    t = A.technicals([10.0, 12.0, 11.0, 13.0, 14.0, 15.0], days, timeframe="weekly")
+    assert t["timeframe"] == "weekly" and t["count"] == 3 and t["last_close"] == 15.0
+
+
+def test_ohlc_validation_and_volume():
+    with pytest.raises(ValueError, match="together"):
+        A.technicals([1.0, 2.0], highs=[1.0, 2.0])
+    with pytest.raises(ValueError, match="low <= close <= high"):
+        A.technicals([1.0, 2.0], highs=[1.0, 1.5], lows=[0.5, 1.0])
+    with pytest.raises(ValueError, match="needs the daily dates"):
+        A.technicals([1.0, 2.0], timeframe="weekly")
+    t = A.technicals([100.0] * 25, volumes=[1000.0] * 24 + [3000.0])
+    assert t["volume"]["last_vs_avg_20"] == round(3000 / 1100, 4)
+    assert "ohlc_indicators" in t, "closes only: says what highs/lows would add"
+
+
+def test_since_entry_trailing_levels():
+    days = [f"2026-03-{d:02d}" for d in range(1, 31)]
+    c = [100.0 + i for i in range(30)]
+    h, l = [x + 1 for x in c], [x - 1 for x in c]
+    t = A.technicals(c, days, h, l, entry_date="2026-03-11")
+    se = t["since_entry"]
+    a14 = A.atr(h, l, c, 14)
+    assert se["first_bar"] == "2026-03-11" and se["bars"] == 20 and se["highest_close"] == 129.0 and se["highest_high"] == 130.0
+    assert se["atr_trail"]["1.5x"] == round(129 - 1.5 * a14, 2) and se["chandelier_since_entry"] == round(130 - 3 * a14, 2)
+    with pytest.raises(ValueError, match="after the last bar"):
+        A.technicals(c, days, h, l, entry_date="2026-04-15")
+    short = A.technicals(c, days, h, l, entry_date="2026-03-11", side="short")["since_entry"]
+    assert short["lowest_close"] == 110.0 and short["atr_trail"]["2x"] == round(110 + 2 * a14, 2)

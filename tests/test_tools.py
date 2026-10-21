@@ -6,6 +6,8 @@ import pytest
 from bse_mcp import bse, tools
 from bse_mcp.tools import ArgError
 
+from . import fixtures as F
+
 
 def test_quarter_naming():
     assert tools.quarter_label(130) == "Q1 FY27 (Jun-26)"
@@ -121,3 +123,27 @@ def test_403_raises_with_remedy(fake):
     fake.refuse.add("getScripHeaderData")
     with pytest.raises(bse.BseError, match="refused.*403"):
         tools.get_quote("500002")
+
+
+def test_price_history_from_the_12_month_chart(fake, monkeypatch):
+    h = tools.get_price_history("500002")
+    assert fake.sent("StockReachGraphCas")[0]["flag"] == "12M"
+    assert h["bars"] == 250 and h["from"] == "2025-10-21" and h["dates"][1] == "2025-10-22" and h["to"] == h["dates"][-1]
+    assert h["closes"][0] == 5000.0 and h["volumes"][0] == 2000.0 and h["symbol"] == "ABB"
+    bad = dict(F.HIST_12M, Data=__import__("json").dumps([{"dttm": "yesterday", "vale1": "1.0"}]))
+    monkeypatch.setattr(F, "HIST_12M", bad)
+    with pytest.raises(bse.BseError, match="unexpected price-history row"):
+        tools.get_price_history("500002")
+
+
+def test_analyze_prices_by_scripcode(fake):
+    t = tools.analyze_prices(scripcode="500002")
+    assert t["count"] == 250 and t["from"] == "2025-10-21" and "BSE's daily closes" in t["source"]
+    assert t["sma"]["sma_200"] is not None and "ohlc_indicators" in t and "price_jumps" not in t and t["volume"]["avg_20"] > 0
+    assert len(t["swings"]["lows"]) == 5 and all(0 < p["rsi"] < 100 for p in t["swings"]["lows"] + t["swings"]["highs"])
+    w = tools.analyze_prices(scripcode="500002", timeframe="weekly")
+    assert w["timeframe"] == "weekly" and 50 <= w["count"] <= 53
+    with pytest.raises(ArgError, match="not both"):
+        tools.analyze_prices([1.0, 2.0], scripcode="500002")
+    with pytest.raises(ArgError, match="scripcode"):
+        tools.analyze_prices()

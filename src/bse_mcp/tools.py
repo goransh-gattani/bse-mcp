@@ -9,7 +9,7 @@ from __future__ import annotations
 import html
 import re
 import urllib.parse
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 from . import bse
@@ -340,14 +340,71 @@ def analyze_fundamentals(scripcode: str, quarters: int = 8) -> dict:
                     "Further reading on these ratios: Zerodha Varsity, Fundamental Analysis https://zerodha.com/varsity/module/fundamental-analysis/"}
 
 
-def analyze_prices(closes: list[float], dates: list[str] | None = None) -> dict:
+def get_price_history(scripcode: str) -> dict:
+    """BSE's daily closes and traded quantity for the last 12 months (the 12M view of the price chart)."""
+    code = _code(scripcode)
+    d = bse.get("StockReachGraphCas", {"flag": "12M", "fromdate": "", "scripcode": code, "seriesid": "", "todate": ""})
+    rows = d.get("Data") if isinstance(d, dict) else None
+    if not isinstance(rows, list) or not rows:
+        raise BseError(f"BSE returned no price history for {code}")
+    dates, closes, volumes = [], [], []
+    for r in rows:
+        price = _num(r.get("vale1") or r.get("vale0"))
+        try:
+            day = datetime.strptime(str(r.get("dttm", ""))[4:15], "%b %d %Y").date().isoformat()  # 'Tue Oct 21 2025 00:00:00'
+        except ValueError:
+            day = None
+        if price is None or day is None:
+            raise BseError(f"unexpected price-history row from BSE: {str(r)[:200]}")
+        dates.append(day), closes.append(price), volumes.append(_num(r.get("vole")) or 0.0)
+    if any(b <= a for a, b in zip(dates, dates[1:])):
+        raise BseError(f"BSE's price history for {code} is not in date order")
+    return {"scripcode": code, "symbol": d.get("Scripname"), "bars": len(dates), "from": dates[0], "to": dates[-1],
+            "dates": dates, "closes": closes, "volumes": volumes,
+            "note": "Daily closes and traded quantity on BSE, oldest first, from BSE's 12-month price chart. There are no daily "
+                    "open, high or low figures here, and the quantities are BSE's alone (NSE usually trades more). To compute "
+                    "indicators, call analyze_prices with this scripcode rather than copying the numbers."}
+
+
+def analyze_prices(closes: list[float] | None = None, dates: list[str] | None = None, highs: list[float] | None = None,
+                   lows: list[float] | None = None, volumes: list[float] | None = None, timeframe: str = "daily",
+                   entry_date: str | None = None, side: str = "long", scripcode: str | None = None) -> dict:
     from . import analysis
 
+    if scripcode:
+        if any(v is not None for v in (closes, dates, highs, lows, volumes)):
+            raise ArgError("pass either scripcode (BSE's daily closes for the last 12 months) or your own series, not both")
+        hist = get_price_history(scripcode)
+        closes, dates, volumes = hist["closes"], hist["dates"], hist["volumes"]
+        source = (f"BSE's daily closes and volumes for {hist['scripcode']}, {hist['from']} to {hist['to']}. BSE gives no daily highs "
+                  "and lows here, so ATR, ADX, stochastic, chandelier and pivots need daily candles from another source.")
+    elif closes is None:
+        raise ArgError("pass closes (oldest first), or scripcode to use BSE's daily closes for the last 12 months")
+    else:
+        source = "the series passed in, oldest first"
     try:
-        out = analysis.technicals(closes, dates)
+        out = analysis.technicals(closes, dates, highs, lows, volumes, timeframe, entry_date, side)
     except ValueError as exc:
         raise ArgError(str(exc)) from None
+    out["source"] = source
     out["definitions"] = analysis.TECHNICAL_DEFINITIONS
-    out["note"] = ("Computed on the closes given (oldest first). Indicators describe past prices; they are not forecasts or advice. "
+    out["note"] = ("Indicators describe past prices; they are not forecasts or advice. "
                    "Further reading: Zerodha Varsity, Technical Analysis https://zerodha.com/varsity/module/technical-analysis/")
+    return out
+
+
+def position_size(capital: float, entry: float, stop: float | None = None, side: str = "long", risk_pct: float = 1.0,
+                  atr: float | None = None, atr_multiplier: float = 2.0, target: float | None = None, leverage: float = 1.0,
+                  max_position_pct: float = 20.0, win_rate: float | None = None, avg_win_loss: float | None = None,
+                  segment: str = "delivery", exchange: str = "NSE", brokerage_per_order: float = 0.0,
+                  brokerage_pct: float = 0.0, dp_charge: float = 0.0, exchange_txn_rate: float | None = None) -> dict:
+    from . import sizing
+
+    try:
+        out = sizing.position_size(capital, entry, stop, side, risk_pct, atr, atr_multiplier, target, leverage, max_position_pct,
+                                   win_rate, avg_win_loss, segment, exchange, brokerage_per_order, brokerage_pct, dp_charge,
+                                   exchange_txn_rate)
+    except sizing.SizingError as exc:
+        raise ArgError(str(exc)) from None
+    out["note"] = "Arithmetic on the inputs given, not a recommendation to trade."
     return out

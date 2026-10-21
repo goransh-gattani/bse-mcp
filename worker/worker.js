@@ -323,34 +323,129 @@ function valuation(t, price, mcapCr, cpu) {
 }
 
 const TECHNICAL_DEFINITIONS = {
-  returns: "close-to-close change over the last N trading days (1w=5, 1m=21, 3m=63, 6m=126, 1y=252, 3y=756, 5y=1260)",
-  cagr: "compound annual growth from the first to the last close (calendar days when dates are given, else 252 trading days a year)",
-  volatility_annualised: "sample standard deviation of daily log returns over the last 252 days (or all, if fewer) x sqrt(252)",
+  returns: "close-to-close change over the last N bars (daily: 1w=5, 1m=21, 3m=63, 6m=126, 1y=252, 3y=756, 5y=1260; weekly: 1m=4, 3m=13, 6m=26, 1y=52, 3y=156, 5y=260)",
+  cagr: "compound annual growth from the first to the last close (calendar days when dates are given, else bars per year)",
+  volatility_annualised: "sample standard deviation of log returns over the last year of bars (or all, if fewer) x sqrt(bars per year)",
   max_drawdown: "largest peak-to-trough fall in the closes",
   sma: "simple moving average of the last N closes",
   ema: "exponential moving average, weight 2/(N+1), seeded with the SMA of the first N closes",
   macd: "EMA12 - EMA26; signal = EMA9 of MACD; histogram = MACD - signal",
   rsi_14: "Wilder's RSI: 100 - 100/(1 + average gain / average loss), Wilder-smoothed over 14 periods",
   bollinger_20_2: "SMA20 +/- 2 population standard deviations of the last 20 closes; percent_b = (close - lower)/(upper - lower)",
-  range_52w: "high and low of the last 252 closes (closing prices only, so intraday extremes are not included)",
+  range_52w: "high and low of the last year of bars (highs/lows when given, else closes)",
   trend: "SMA50 against SMA200: 'golden cross' state when above, 'death cross' state when below",
+  atr_14: "Wilder's average true range; true range = max(high - low, |high - previous close|, |low - previous close|)",
+  adx_14: "Wilder's ADX with +DI/-DI from directional movement; under 20 weak trend, 20-25 emerging, over 25 trending",
+  stochastic_14_3: "%K = (close - lowest low of 14) / (highest high of 14 - lowest low of 14) x 100; %D = 3-bar SMA of %K",
+  chandelier_exit_22_3: "long: highest high of 22 bars - 3 x ATR(22); short: lowest low of 22 bars + 3 x ATR(22)",
+  pivots_classic: "from the last bar's high/low/close: P = (H+L+C)/3, R1 = 2P-L, S1 = 2P-H, R2 = P+(H-L), S2 = P-(H-L), R3 = H+2(P-L), S3 = L-2(H-P)",
+  swings: "swing high/low = a bar whose high (low) is above (below) the 2 bars on each side (closes when no highs/lows are given); rsi = RSI(14) at that bar",
+  fibonacci: "from the highest high and lowest low of the lookback window: retracements measured back from the end of the move; extensions = start of the move + move x ratio; pullback.projections = end of the pullback (point C) + move x ratio, the usual swing-target convention",
+  rsi_divergence: "comparing the last two swing lows (highs) with RSI(14) at those bars: regular bullish = lower price low with higher RSI low; hidden bullish = higher price low with lower RSI low; bearish mirror on swing highs",
+  volume: "last bar's volume against the 20-bar average",
+  since_entry: "from the bars on or after entry_date: highest close/high (long) or lowest close/low (short); atr_trail = highest close - ATR(14) x multiple; chandelier_since_entry = highest high - 3 x ATR(14); structure_trail = latest swing low since entry (mirror for shorts)",
+  price_jumps: "one-bar moves of 25% or more in the daily closes given; a split or bonus in a series that isn't adjusted for it looks like this",
+  weekly: "weekly bars built from the daily series by ISO week: last close, highest high, lowest low, summed volume; dated by the week's last trading day",
 };
-const WINDOWS = { "1w": 5, "1m": 21, "3m": 63, "6m": 126, "1y": 252, "3y": 756, "5y": 1260 };
-const sma = (xs, n) => (xs.length >= n ? xs.slice(-n).reduce((a, b) => a + b, 0) / n : null);
+const WINDOWS = { daily: { "1w": 5, "1m": 21, "3m": 63, "6m": 126, "1y": 252, "3y": 756, "5y": 1260 }, weekly: { "1m": 4, "3m": 13, "6m": 26, "1y": 52, "3y": 156, "5y": 260 } };
+const BARS_PER_YEAR = { daily: 252, weekly: 52 };
+const sum = (v) => v.reduce((a, b) => a + b, 0);
+const sma = (xs, n) => (xs.length >= n ? sum(xs.slice(-n)) / n : null);
 function emaSeries(xs, n) {
   if (xs.length < n) return [];
-  const a = 2 / (n + 1), out = [xs.slice(0, n).reduce((p, c) => p + c, 0) / n];
+  const a = 2 / (n + 1), out = [sum(xs.slice(0, n)) / n];
   for (const x of xs.slice(n)) out.push(a * x + (1 - a) * out[out.length - 1]);
   return out;
 }
-function rsi(xs, n = 14) {
-  if (xs.length < n + 1) return null;
+function rsiSeries(xs, n = 14) {
+  const out = new Array(xs.length).fill(null);
+  if (xs.length < n + 1) return out;
   const ch = xs.slice(1).map((b, i) => b - xs[i]);
-  let gain = ch.slice(0, n).reduce((s, c) => s + Math.max(c, 0), 0) / n;
-  let loss = ch.slice(0, n).reduce((s, c) => s + Math.max(-c, 0), 0) / n;
-  for (const c of ch.slice(n)) { gain = (gain * (n - 1) + Math.max(c, 0)) / n; loss = (loss * (n - 1) + Math.max(-c, 0)) / n; }
-  if (loss === 0) return gain > 0 ? 100 : 50;
-  return 100 - 100 / (1 + gain / loss);
+  let gain = sum(ch.slice(0, n).map((c) => Math.max(c, 0))) / n, loss = sum(ch.slice(0, n).map((c) => Math.max(-c, 0))) / n;
+  const val = (g, l) => (l === 0 ? (g > 0 ? 100 : 50) : 100 - 100 / (1 + g / l));
+  out[n] = val(gain, loss);
+  ch.slice(n).forEach((c, j) => { gain = (gain * (n - 1) + Math.max(c, 0)) / n; loss = (loss * (n - 1) + Math.max(-c, 0)) / n; out[n + 1 + j] = val(gain, loss); });
+  return out;
+}
+const rsi = (xs, n = 14) => (xs.length >= n + 1 ? rsiSeries(xs, n)[xs.length - 1] : null);
+const trueRanges = (h, l, c) => [h[0] - l[0], ...c.slice(1).map((_, j) => { const i = j + 1; return Math.max(h[i] - l[i], Math.abs(h[i] - c[i - 1]), Math.abs(l[i] - c[i - 1])); })];
+function atr(h, l, c, n = 14) {
+  const tr = trueRanges(h, l, c);
+  if (tr.length < n) return null;
+  let a = sum(tr.slice(0, n)) / n;
+  for (const x of tr.slice(n)) a = (a * (n - 1) + x) / n;
+  return a;
+}
+function adx(h, l, c, n = 14) {
+  if (c.length < 2 * n) return null;
+  const pdm = [], mdm = [], tr = [];
+  for (let i = 1; i < c.length; i++) {
+    const up = h[i] - h[i - 1], down = l[i - 1] - l[i];
+    pdm.push(up > down && up > 0 ? up : 0); mdm.push(down > up && down > 0 ? down : 0);
+    tr.push(Math.max(h[i] - l[i], Math.abs(h[i] - c[i - 1]), Math.abs(l[i] - c[i - 1])));
+  }
+  let sp = sum(pdm.slice(0, n)), sm = sum(mdm.slice(0, n)), st = sum(tr.slice(0, n)), pdi = 0, mdi = 0;
+  const dxs = [];
+  for (let i = n - 1; i < tr.length; i++) {
+    if (i >= n) { sp = sp - sp / n + pdm[i]; sm = sm - sm / n + mdm[i]; st = st - st / n + tr[i]; }
+    [pdi, mdi] = st ? [100 * sp / st, 100 * sm / st] : [0, 0];
+    dxs.push(pdi + mdi ? 100 * Math.abs(pdi - mdi) / (pdi + mdi) : 0);
+  }
+  if (dxs.length < n) return null;
+  let a = sum(dxs.slice(0, n)) / n;
+  for (const x of dxs.slice(n)) a = (a * (n - 1) + x) / n;
+  return { adx: rnd(a, 2), plus_di: rnd(pdi, 2), minus_di: rnd(mdi, 2), strength: a < 20 ? "weak or no trend" : a < 25 ? "emerging trend" : "trending",
+    direction: pdi > mdi ? "up (+DI above -DI)" : mdi > pdi ? "down (-DI above +DI)" : "flat" };
+}
+function stochastic(h, l, c, n = 14, d = 3) {
+  if (c.length < n + d - 1) return null;
+  const ks = [];
+  for (let i = c.length - d; i < c.length; i++) {
+    const hh = Math.max(...h.slice(i - n + 1, i + 1)), ll = Math.min(...l.slice(i - n + 1, i + 1));
+    ks.push(hh > ll ? 100 * (c[i] - ll) / (hh - ll) : 50);
+  }
+  return { k: rnd(ks[ks.length - 1], 2), d: rnd(sum(ks) / d, 2) };
+}
+function swings(h, l, dates, k = 2) {
+  const d = (i) => (dates ? dates[i] : i), highs = [], lows = [];
+  for (let i = k; i < h.length - k; i++) {
+    const around = [...Array(k).keys()].flatMap((j) => [i - 1 - j, i + 1 + j]);
+    if (around.every((j) => h[i] > h[j])) highs.push({ at: d(i), price: h[i], _i: i });
+    if (around.every((j) => l[i] < l[j])) lows.push({ at: d(i), price: l[i], _i: i });
+  }
+  return { highs, lows };
+}
+function fibonacci(h, l, last, dates, lookback = 126) {
+  const hw = h.slice(-lookback), lw = l.slice(-lookback);
+  if (hw.length < 3) return null;
+  const off = h.length - hw.length, hiI = off + hw.indexOf(Math.max(...hw)), loI = off + lw.indexOf(Math.min(...lw));
+  const hi = h[hiI], lo = l[loI], rng = hi - lo;
+  if (rng <= 0) return null;
+  const up = loI < hiI, pct = (r) => `${+(r * 100).toFixed(4)}%`, d = (i) => (dates ? dates[i] : i);
+  return { move: up ? "up" : "down", swing_low: { at: d(loI), price: lo }, swing_high: { at: d(hiI), price: hi },
+    retracements: Object.fromEntries([0.236, 0.382, 0.5, 0.618, 0.786].map((r) => [pct(r), rnd(up ? hi - rng * r : lo + rng * r, 2)])),
+    extensions: Object.fromEntries([1.272, 1.618, 2.0, 2.618].map((r) => [pct(r), rnd(up ? lo + rng * r : hi - rng * r, 2)])),
+    retraced_so_far: rnd(up ? (hi - last) / rng : (last - lo) / rng), lookback_bars: hw.length, pullback: pullback(h, l, up, up ? hiI : loI, hi, lo, rng, d) };
+}
+// Projections from the end of the pullback (point C): C + move x ratio in an up move, C - move x ratio in a down move.
+function pullback(h, l, up, endI, hi, lo, rng, d) {
+  const after = (up ? l : h).slice(endI + 1);
+  if (!after.length) return null;
+  const cI = endI + 1 + after.indexOf(up ? Math.min(...after) : Math.max(...after)), c = (up ? l : h)[cI];
+  if (up ? c >= hi : c <= lo) return null;
+  return { at: d(cI), price: c, projections: Object.fromEntries([1, 1.272, 1.618, 2].map((r) => [`${+(r * 100).toFixed(4)}%`, rnd(up ? c + rng * r : c - rng * r, 2)])) };
+}
+function rsiDivergence(closes, h, l, dates, lookback = 90) {
+  const rs = rsiSeries(closes), sw = swings(h, l, dates), start = closes.length - lookback, found = [];
+  for (const [kind, pts0] of [["bullish", sw.lows], ["bearish", sw.highs]]) {
+    const pts = pts0.filter((p) => p._i >= start && rs[p._i] != null);
+    if (pts.length < 2) continue;
+    const [a, b] = pts.slice(-2), ra = rs[a._i], rb = rs[b._i];
+    const typ = kind === "bullish" ? (b.price < a.price && rb > ra ? "regular" : b.price > a.price && rb < ra ? "hidden" : null)
+      : (b.price > a.price && rb < ra ? "regular" : b.price < a.price && rb > ra ? "hidden" : null);
+    if (typ) found.push({ type: `${typ} ${kind}`, points: [a, b].map((p) => ({ at: p.at, price: p.price, rsi: rnd(rs[p._i], 2) })) });
+  }
+  return found;
 }
 function maxDrawdown(xs, dates) {
   let peak = 0, worst = 0, at = [0, 0];
@@ -358,62 +453,221 @@ function maxDrawdown(xs, dates) {
   const d = (i) => (dates ? dates[i] : i);
   return worst < 0 ? { drawdown: rnd(worst), peak: d(at[0]), trough: d(at[1]) } : { drawdown: 0, peak: null, trough: null };
 }
-const stdev = (v, pop) => { const m = v.reduce((a, b) => a + b, 0) / v.length; return Math.sqrt(v.reduce((s, x) => s + (x - m) ** 2, 0) / (v.length - (pop ? 0 : 1))); };
+const stdev = (v, pop) => { const m = sum(v) / v.length; return Math.sqrt(sum(v.map((x) => (x - m) ** 2)) / (v.length - (pop ? 0 : 1))); };
 function parseDate(s) {
   const t = String(s).trim();
   let m = /^(\d{4})-(\d{2})-(\d{2})/.exec(t) || /^(\d{4})(\d{2})(\d{2})$/.exec(t);
   if (m) return Date.UTC(+m[1], +m[2] - 1, +m[3]);
   m = /^(\d{1,2})[- ](\w{3})[- ](\d{4})$/.exec(t);
-  if (m && MONTHS.includes(m[2].slice(0, 1).toUpperCase() + m[2].slice(1, 3).toLowerCase())) return Date.UTC(+m[3], MONTHS.indexOf(m[2].slice(0, 1).toUpperCase() + m[2].slice(1, 3).toLowerCase()), +m[1]);
+  const mon = m ? m[2][0].toUpperCase() + m[2].slice(1, 3).toLowerCase() : null;
+  if (m && MONTHS.includes(mon)) return Date.UTC(+m[3], MONTHS.indexOf(mon), +m[1]);
   m = /^(\d{2})-(\d{2})-(\d{4})$/.exec(t);
   if (m) return Date.UTC(+m[3], +m[2] - 1, +m[1]);
   throw new ToolFail(`unrecognised date ${JSON.stringify(s)}; use YYYY-MM-DD`);
 }
+function isoWeek(ms) { // [ISO year, ISO week] of a UTC date
+  const d = new Date(ms), day = (d.getUTCDay() + 6) % 7;
+  d.setUTCDate(d.getUTCDate() - day + 3);
+  const y = d.getUTCFullYear(), jan4 = new Date(Date.UTC(y, 0, 4));
+  return [y, 1 + Math.round(((d - jan4) / 864e5 - 3 + ((jan4.getUTCDay() + 6) % 7)) / 7)];
+}
+function toWeekly(dates, closes, highs, lows, volumes) {
+  const out = { dates: [], closes: [], highs: [], lows: [], volumes: volumes ? [] : null };
+  let prev = null;
+  dates.forEach((ds, i) => {
+    const key = isoWeek(parseDate(ds)).join("-"), n = out.dates.length - 1;
+    if (key !== prev) { out.dates.push(ds); out.closes.push(closes[i]); out.highs.push(highs[i]); out.lows.push(lows[i]); if (volumes) out.volumes.push(volumes[i]); prev = key; }
+    else { out.dates[n] = ds; out.closes[n] = closes[i]; out.highs[n] = Math.max(out.highs[n], highs[i]); out.lows[n] = Math.min(out.lows[n], lows[i]); if (volumes) out.volumes[n] += volumes[i]; }
+  });
+  return out;
+}
+function series(name, vals, n) {
+  if (vals == null) return null;
+  const xs = vals.map(Number);
+  if (xs.length !== n) throw new ToolFail(`${name} (${xs.length}) and closes (${n}) differ in length`);
+  if (xs.some((x) => !Number.isFinite(x) || x < 0)) throw new ToolFail(`${name} must be non-negative numbers`);
+  return xs;
+}
 
-function technicals(closes, dates) {
+function sinceEntry(closes, H, Lo, dates, entryDate, side, atr14) {
+  const start = parseDate(entryDate), i0 = dates.findIndex((ds) => parseDate(ds) >= start);
+  if (i0 < 0) throw new ToolFail(`entry_date ${entryDate} is after the last bar`);
+  const c = closes.slice(i0), h = H.slice(i0), lo = Lo.slice(i0), sw = swings(H, Lo, dates), long = side === "long";
+  const out = { entry_date: entryDate, first_bar: dates[i0], bars: c.length };
+  const ref = long ? Math.max(...c) : Math.min(...c), ext = long ? Math.max(...h) : Math.min(...lo), s = long ? -1 : 1;
+  Object.assign(out, long ? { highest_close: ref, highest_high: ext } : { lowest_close: ref, lowest_low: ext });
+  const pts = (long ? sw.lows : sw.highs).filter((p) => p._i >= i0);
+  out.structure_trail = pts.length ? { at: pts[pts.length - 1].at, price: pts[pts.length - 1].price } : null;
+  if (atr14 != null) {
+    out.atr_trail = Object.fromEntries([1.5, 2, 3].map((m) => [`${m}x`, rnd(ref + s * m * atr14, 2)]));
+    out.chandelier_since_entry = rnd(ext + s * 3 * atr14, 2);
+  } else out.atr_levels = "pass highs and lows for the ATR trail and chandelier levels";
+  return out;
+}
+
+function technicals(closes, dates, highs, lows, volumes, timeframe = "daily", entryDate = null, side = "long") {
   if (!Array.isArray(closes)) throw new ToolFail("closes must be a list of numbers");
-  const xs = closes.map(Number);
+  let xs = closes.map(Number);
   if (xs.length < 2) throw new ToolFail("need at least 2 closes");
   if (xs.some((x) => !Number.isFinite(x) || x <= 0)) throw new ToolFail("closes must be positive numbers");
+  if (!["daily", "weekly"].includes(timeframe)) throw new ToolFail("timeframe must be 'daily' or 'weekly'");
   let parsed = null;
   if (dates != null) {
     if (dates.length !== xs.length) throw new ToolFail(`dates (${dates.length}) and closes (${xs.length}) differ in length`);
     parsed = dates.map(parseDate);
     if (parsed.some((d, i) => i && d <= parsed[i - 1])) throw new ToolFail("dates must be strictly increasing: pass the series oldest first");
   }
-  const last = xs[xs.length - 1];
-  const returns = Object.fromEntries(Object.entries(WINDOWS).filter(([, n]) => xs.length > n).map(([k, n]) => [k, rnd(last / xs[xs.length - 1 - n] - 1)]));
-  const years = parsed ? (parsed[parsed.length - 1] - parsed[0]) / 864e5 / 365.25 : (xs.length - 1) / 252;
-  const cagr = years >= 1 ? rnd((last / xs[0]) ** (1 / years) - 1) : null;
-  const logr = xs.slice(1).map((b, i) => Math.log(b / xs[i])).slice(-252);
-  const vol = logr.length >= 2 ? rnd(stdev(logr) * Math.sqrt(252)) : null;
-  const e12 = emaSeries(xs, 12), e26 = emaSeries(xs, 26);
+  let hs = series("highs", highs, xs.length), ls = series("lows", lows, xs.length), vs = series("volumes", volumes, xs.length);
+  if ((hs == null) !== (ls == null)) throw new ToolFail("pass highs and lows together");
+  if (hs && hs.some((h, i) => h < ls[i] || !(ls[i] <= xs[i] && xs[i] <= h))) throw new ToolFail("each bar needs low <= close <= high");
+  // Checked on the daily input, before any weekly grouping: that is where an unadjusted split shows as one bar.
+  const jumps = xs.map((x, i) => i && Math.abs(x / xs[i - 1] - 1) >= 0.25 ? { at: dates ? dates[i] : i, change: rnd(x / xs[i - 1] - 1) } : null).filter(Boolean);
+  if (timeframe === "weekly") {
+    if (dates == null) throw new ToolFail("timeframe='weekly' needs the daily dates to group bars into weeks");
+    const w = toWeekly(dates, xs, hs || xs, ls || xs, vs);
+    const hadHL = hs != null;
+    dates = w.dates; xs = w.closes; vs = w.volumes; [hs, ls] = hadHL ? [w.highs, w.lows] : [null, null];
+    parsed = dates.map(parseDate);
+  }
+  const haveHL = hs != null, H = haveHL ? hs : xs, Lo = haveHL ? ls : xs, bpy = BARS_PER_YEAR[timeframe], last = xs[xs.length - 1];
+  const returns = Object.fromEntries(Object.entries(WINDOWS[timeframe]).filter(([, n]) => xs.length > n).map(([k, n]) => [k, rnd(last / xs[xs.length - 1 - n] - 1)]));
+  const years = parsed ? (parsed[parsed.length - 1] - parsed[0]) / 864e5 / 365.25 : (xs.length - 1) / bpy;
+  const logr = xs.slice(1).map((b, i) => Math.log(b / xs[i])).slice(-bpy);
+  const e12 = emaSeries(xs, 12), e26 = emaSeries(xs, 26), e50 = emaSeries(xs, 50);
   let macd = null;
   if (e26.length) {
-    const line = e26.map((v, i) => e12[e12.length - e26.length + i] - v);
-    const sig = emaSeries(line, 9);
+    const line = e26.map((v, i) => e12[e12.length - e26.length + i] - v), sig = emaSeries(line, 9);
     if (sig.length) macd = { macd: rnd(line[line.length - 1]), signal: rnd(sig[sig.length - 1]), histogram: rnd(line[line.length - 1] - sig[sig.length - 1]) };
   }
   let boll = null;
   if (xs.length >= 20) {
-    const w = xs.slice(-20), mid = w.reduce((a, b) => a + b, 0) / 20, sd = stdev(w, true), up = mid + 2 * sd, lo = mid - 2 * sd;
+    const w = xs.slice(-20), mid = sum(w) / 20, sd = stdev(w, true), up = mid + 2 * sd, lo = mid - 2 * sd;
     boll = { middle: rnd(mid, 2), upper: rnd(up, 2), lower: rnd(lo, 2), percent_b: up > lo ? rnd((last - lo) / (up - lo)) : null, bandwidth: rnd((up - lo) / mid) };
   }
-  const yr = xs.slice(-252), hi = Math.max(...yr), lo52 = Math.min(...yr);
-  const s50 = sma(xs, 50), s200 = sma(xs, 200);
+  const hi = Math.max(...H.slice(-bpy)), lo52 = Math.min(...Lo.slice(-bpy)), s50 = sma(xs, 50), s200 = sma(xs, 200);
+  const sw = swings(H, Lo, dates), rs = rsiSeries(xs), strip = (p) => ({ at: p.at, price: p.price, rsi: rnd(rs[p._i], 2) });
   const out = {
-    count: xs.length, from: dates ? dates[0] : null, to: dates ? dates[dates.length - 1] : null, last_close: last,
-    returns, cagr, volatility_annualised: vol, max_drawdown: maxDrawdown(xs, dates), max_drawdown_1y: maxDrawdown(xs.slice(-252), dates ? dates.slice(-252) : null),
+    timeframe, count: xs.length, from: dates ? dates[0] : null, to: dates ? dates[dates.length - 1] : null, last_close: last,
+    returns, cagr: years >= 1 ? rnd((last / xs[0]) ** (1 / years) - 1) : null, volatility_annualised: logr.length >= 2 ? rnd(stdev(logr) * Math.sqrt(bpy)) : null,
+    max_drawdown: maxDrawdown(xs, dates), max_drawdown_1y: maxDrawdown(xs.slice(-bpy), dates ? dates.slice(-bpy) : null),
     sma: Object.fromEntries([20, 50, 200].map((n) => [`sma_${n}`, rnd(sma(xs, n), 2)])),
     price_vs_sma: Object.fromEntries([20, 50, 200].map((n) => [`vs_sma_${n}`, sma(xs, n) ? rnd(last / sma(xs, n) - 1) : null])),
-    ema: { ema_12: e12.length ? rnd(e12[e12.length - 1], 2) : null, ema_26: e26.length ? rnd(e26[e26.length - 1], 2) : null },
+    ema: { ema_12: e12.length ? rnd(e12[e12.length - 1], 2) : null, ema_26: e26.length ? rnd(e26[e26.length - 1], 2) : null, ema_50: e50.length ? rnd(e50[e50.length - 1], 2) : null },
     macd, rsi_14: rnd(rsi(xs), 2), bollinger_20_2: boll,
-    range_52w: { high: hi, low: lo52, position: hi > lo52 ? rnd((last - lo52) / (hi - lo52)) : null, below_high: rnd(last / hi - 1), window_days: yr.length },
+    range_52w: { high: hi, low: lo52, position: hi > lo52 ? rnd((last - lo52) / (hi - lo52)) : null, below_high: rnd(last / hi - 1), window_bars: xs.slice(-bpy).length },
     trend: s50 && s200 ? { sma50_vs_sma200: rnd(s50 / s200 - 1), state: s50 > s200 ? "golden cross (SMA50 above SMA200)" : "death cross (SMA50 below SMA200)" } : null,
+    ...(jumps.length ? { price_jumps: { bars: jumps.slice(-5), note: "If any of these is a split or bonus, the earlier prices aren't adjusted for it and every indicator spanning it is wrong: divide the earlier prices by the ratio (multiply the volumes), or start the series after it." } } : {}),
+    swings: { highs: sw.highs.slice(-5).map(strip), lows: sw.lows.slice(-5).map(strip) },
+    fibonacci: fibonacci(H, Lo, last, dates, timeframe === "daily" ? 126 : 52),
+    rsi_divergence: rsiDivergence(xs, H, Lo, dates, timeframe === "daily" ? 90 : 52),
   };
-  const missing = [["sma_200 / trend", 200], ["1y range and volatility", 252], ["macd", 34], ["rsi_14", 15], ["bollinger", 20]].filter(([, need]) => xs.length < need).map(([n]) => n);
-  if (missing.length) out.needs_more_data = `${xs.length} closes given; for ${missing.join(", ")} pass more history (~260 trading days covers everything except 3y/5y returns)`;
+  if (haveHL) {
+    const a14 = atr(H, Lo, xs, 14), a22 = atr(H, Lo, xs, 22), n = xs.length - 1, P = (H[n] + Lo[n] + last) / 3;
+    Object.assign(out, { atr_14: rnd(a14, 2), atr_14_pct: rnd(ratio(a14, last)), adx_14: adx(H, Lo, xs, 14), stochastic_14_3: stochastic(H, Lo, xs),
+      chandelier_exit_22_3: a22 != null ? { long: rnd(Math.max(...H.slice(-22)) - 3 * a22, 2), short: rnd(Math.min(...Lo.slice(-22)) + 3 * a22, 2) } : null,
+      pivots_classic: Object.fromEntries(Object.entries({ P, R1: 2 * P - Lo[n], S1: 2 * P - H[n], R2: P + (H[n] - Lo[n]), S2: P - (H[n] - Lo[n]), R3: H[n] + 2 * (P - Lo[n]), S3: Lo[n] - 2 * (H[n] - P) }).map(([k, v]) => [k, rnd(v, 2)])) });
+  } else out.ohlc_indicators = "pass highs and lows for ATR, ADX, stochastic, chandelier exit and pivots";
+  if (entryDate) {
+    if (dates == null) throw new ToolFail("entry_date needs dates");
+    if (!["long", "short"].includes(side)) throw new ToolFail("side must be 'long' or 'short'");
+    out.since_entry = sinceEntry(xs, H, Lo, dates, entryDate, side, haveHL ? atr(H, Lo, xs, 14) : null);
+  }
+  if (vs && vs.length >= 20) { const avg = sum(vs.slice(-20)) / 20; out.volume = { last: vs[vs.length - 1], avg_20: rnd(avg, 2), last_vs_avg_20: rnd(ratio(vs[vs.length - 1], avg)) }; }
+  const missing = [["sma_200 / trend", 200], ["1y range and volatility", bpy], ["adx", 28], ["macd", 34], ["rsi_14", 15], ["bollinger", 20]].filter(([, n]) => xs.length < n).map(([k]) => k);
+  if (missing.length) out.needs_more_data = `${xs.length} ${timeframe} bars; for ${missing.join(", ")} pass more history (about ${bpy + 10} ${timeframe} bars covers everything except 3y/5y returns)`;
   return out;
+}
+
+// ---- position sizing and Indian cash-equity costs (mirrors src/bse_mcp/sizing.py)
+const RATES_AS_OF = "Oct 2026", RATES_SOURCE = "https://upstox.com/brokerage-charges/";
+const DEFAULT_RATES = { delivery: { stt_buy: 0.001, stt_sell: 0.001, stamp_buy: 0.00015 }, intraday: { stt_buy: 0, stt_sell: 0.00025, stamp_buy: 0.00003 },
+  exchange_txn: { NSE: 0.0000307, BSE: null }, sebi_fee: 0.000001, gst: 0.18 };
+const SIZING_DEFINITIONS = {
+  risk_amount: "capital x risk_pct: what you lose if the stop is hit (before costs)",
+  shares: "the smallest of: risk_amount / (entry - stop), capital x leverage / entry, and capital x max_position_pct / entry; rounded down",
+  atr_stop: "when no stop is given: entry - atr x atr_multiplier for a long (plus for a short)",
+  reward_to_risk: "(target - entry) / (entry - stop) per share, before costs; net figures include round-trip costs",
+  expected_value: "win_rate x net gain at target - (1 - win_rate) x net loss at stop, per trade",
+  kelly: "W - (1 - W) / R with W = win rate and R = average win / average loss; half-Kelly is the usual practical cap",
+  costs: "STT, exchange transaction charge, SEBI fee, stamp duty (buy side), brokerage and GST (18% on brokerage + exchange charge + SEBI fee), plus DP charge on delivery sells",
+  breakeven_move: "price move needed to cover the round-trip costs",
+};
+function tradeCosts(buy, sell, segment = "delivery", exchange = "NSE", perOrder = 0, pct = 0, dp = 0, txnRate = null) {
+  if (!["delivery", "intraday"].includes(segment)) throw new ToolFail("segment must be 'delivery' or 'intraday'");
+  if (!["NSE", "BSE"].includes(exchange)) throw new ToolFail("exchange must be 'NSE' or 'BSE'");
+  const seg = DEFAULT_RATES[segment], notes = [];
+  let txn = txnRate != null ? txnRate : DEFAULT_RATES.exchange_txn[exchange];
+  if (txn == null) { txn = DEFAULT_RATES.exchange_txn.NSE; notes.push("BSE's transaction charge varies by scrip group; NSE's rate used as an approximation (pass exchange_txn_rate for the exact one)"); }
+  const brokerage = sum([buy, sell].filter(Boolean).map((v) => (perOrder && pct ? Math.min(perOrder, v * pct) : perOrder || v * pct)));
+  const stt = buy * seg.stt_buy + sell * seg.stt_sell, exch = (buy + sell) * txn, sebi = (buy + sell) * DEFAULT_RATES.sebi_fee, stamp = buy * seg.stamp_buy;
+  const gst = (brokerage + exch + sebi) * DEFAULT_RATES.gst, dpc = segment === "delivery" && sell ? dp : 0;
+  if (!perOrder && !pct) notes.push("brokerage assumed 0 (pass brokerage_per_order and/or brokerage_pct for your broker)");
+  return { total: rnd(brokerage + stt + exch + sebi + stamp + gst + dpc, 2), stt: rnd(stt, 2), exchange_txn: rnd(exch, 2), sebi_fee: rnd(sebi, 2), stamp_duty: rnd(stamp, 2),
+    brokerage: rnd(brokerage, 2), gst: rnd(gst, 2), dp_charge: rnd(dpc, 2), notes };
+}
+function positionSize(a) {
+  const { capital, entry, side = "long", risk_pct = 1, atr: atrV = null, atr_multiplier = 2, target = null, leverage = 1, max_position_pct = 20,
+    win_rate = null, avg_win_loss = null, segment = "delivery", exchange = "NSE", brokerage_per_order = 0, brokerage_pct = 0, dp_charge = 0, exchange_txn_rate = null } = a;
+  let stop = a.stop ?? null;
+  if (!(capital > 0) || !(entry > 0)) throw new ToolFail("capital and entry must be positive");
+  if (!["long", "short"].includes(side)) throw new ToolFail("side must be 'long' or 'short'");
+  if (!(risk_pct > 0 && risk_pct <= 10)) throw new ToolFail("risk_pct is a percent of capital, between 0 and 10 (1-2 is the usual range)");
+  if (leverage < 1) throw new ToolFail("leverage must be 1 (none) or more");
+  const sign = side === "long" ? 1 : -1;
+  let stopBasis = "given";
+  if (stop == null) {
+    if (!(atrV > 0)) throw new ToolFail("pass a stop price, or atr (and optionally atr_multiplier) to place the stop from volatility");
+    stop = entry - sign * atrV * atr_multiplier; stopBasis = `entry ${sign > 0 ? "-" : "+"} ${atr_multiplier} x ATR`;
+  }
+  if (sign * (entry - stop) <= 0) throw new ToolFail(`for a ${side} the stop must be ${sign > 0 ? "below" : "above"} the entry`);
+  if (target != null && sign * (target - entry) <= 0) throw new ToolFail(`for a ${side} the target must be ${sign > 0 ? "above" : "below"} the entry`);
+  const perShare = Math.abs(entry - stop), riskAmount = capital * risk_pct / 100;
+  const byRisk = Math.floor(riskAmount / perShare), byCapital = Math.floor(capital * leverage / entry), byCap = Math.floor(capital * max_position_pct / 100 / entry);
+  const shares = Math.min(byRisk, byCapital, byCap);
+  const binding = shares === byRisk ? "risk" : shares === byCapital ? "capital (incl. leverage)" : `${+max_position_pct}% single-stock cap`;
+  if (shares < 1) throw new ToolFail(`position rounds to 0 shares (binding limit: ${binding}); widen risk_pct, tighten the stop, or add capital`);
+  const notes = leverage > 1 ? ["with leverage a gap through the stop loses more than planned; common practice is to divide risk_pct by the leverage"] : [];
+  const roundTrip = (exit) => { const [b, s] = sign > 0 ? [entry, exit] : [exit, entry]; return tradeCosts(shares * b, shares * s, segment, exchange, brokerage_per_order, brokerage_pct, dp_charge, exchange_txn_rate); };
+  const cStop = roundTrip(stop);
+  const out = { side, entry, stop: rnd(stop, 2), stop_basis: stopBasis, risk_per_share: rnd(perShare, 2), risk_amount: rnd(riskAmount, 2), shares,
+    position_value: rnd(shares * entry, 2), position_pct_of_capital: rnd(shares * entry / capital * 100, 2), binding_limit: binding,
+    limits: { by_risk: byRisk, by_capital: byCapital, by_single_stock_cap: byCap },
+    loss_at_stop: { gross: rnd(shares * perShare, 2), costs: cStop.total, net: rnd(shares * perShare + cStop.total, 2) }, costs_at_stop: cStop,
+    breakeven_move: rnd(roundTrip(entry).total / shares, 4) };
+  if (target != null) {
+    const cT = roundTrip(target), gain = shares * Math.abs(target - entry);
+    out.gain_at_target = { gross: rnd(gain, 2), costs: cT.total, net: rnd(gain - cT.total, 2) };
+    out.reward_to_risk = rnd(Math.abs(target - entry) / perShare, 2);
+    out.reward_to_risk_net = rnd((gain - cT.total) / out.loss_at_stop.net, 2);
+    if (win_rate != null) {
+      if (!(win_rate > 0 && win_rate < 1)) throw new ToolFail("win_rate is a fraction between 0 and 1 (e.g. 0.45)");
+      out.expected_value = rnd(win_rate * out.gain_at_target.net - (1 - win_rate) * out.loss_at_stop.net, 2);
+      out.breakeven_win_rate = rnd(out.loss_at_stop.net / (out.loss_at_stop.net + out.gain_at_target.net), 4);
+    }
+  }
+  if (win_rate != null) {
+    const R = avg_win_loss || out.reward_to_risk;
+    if (R) { const k = win_rate - (1 - win_rate) / R; out.kelly = { full: rnd(k, 4), half: rnd(k / 2, 4), R_used: R,
+      note: k <= 0 ? "negative means the edge doesn't pay: don't take the trade" : "fraction of capital to risk per trade; half-Kelly is the usual practical cap" }; }
+  }
+  return { ...out, rates: { as_of: RATES_AS_OF, source: RATES_SOURCE, segment, exchange }, notes: [...notes, ...cStop.notes], definitions: SIZING_DEFINITIONS,
+    note: "Arithmetic on the inputs given, not a recommendation to trade." };
+}
+
+// ---- daily price history: the 12-month view of BSE's price chart (mirrors tools.get_price_history)
+const PRICE_HISTORY_NOTE = "Daily closes and traded quantity on BSE, oldest first, from BSE's 12-month price chart. There are no daily open, high or low figures here, and the quantities are BSE's alone (NSE usually trades more). To compute indicators, call analyze_prices with this scripcode rather than copying the numbers.";
+async function priceHistory(sc) {
+  const d = await bseGet("StockReachGraphCas", { flag: "12M", fromdate: "", scripcode: sc, seriesid: "", todate: "" });
+  const rows = d && d.Data;
+  if (!Array.isArray(rows) || !rows.length) throw new ToolFail(`BSE returned no price history for ${sc}`);
+  const dates = [], closes = [], volumes = [];
+  for (const r of rows) {
+    const price = num(r.vale1 || r.vale0), m = /^\w{3} (\w{3}) (\d{1,2}) (\d{4})/.exec(String(r.dttm || "")); // 'Tue Oct 21 2025 00:00:00'
+    if (price == null || !m || !MONTHS.includes(m[1])) throw new ToolFail(`unexpected price-history row from BSE: ${JSON.stringify(r).slice(0, 200)}`);
+    dates.push(`${m[3]}-${String(MONTHS.indexOf(m[1]) + 1).padStart(2, "0")}-${m[2].padStart(2, "0")}`); closes.push(price); volumes.push(num(r.vole) || 0);
+  }
+  if (dates.some((x, i) => i && x <= dates[i - 1])) throw new ToolFail(`BSE's price history for ${sc} is not in date order`);
+  return { scripcode: sc, symbol: d.Scripname, bars: dates.length, from: dates[0], to: dates[dates.length - 1], dates, closes, volumes, note: PRICE_HISTORY_NOTE };
 }
 
 const TOOLS = [
@@ -480,6 +734,12 @@ const TOOLS = [
       const keys = ["Name", "scrip_cd", "LTP", "Change", "PE", "PB", "EPS", "Revenue", "PAT", "OPM", "NPM", "w52hi", "w52lo", "Results_QuarterName"];
       return d.Table.map((r) => Object.fromEntries(keys.map((k) => [k, r[k]])));
     },
+  },
+  {
+    name: "get_price_history",
+    description: "Daily closing prices and traded quantity on BSE for one scrip over the last 12 months, oldest first (dates, closes, volumes), from BSE's price chart. No daily open/high/low. For indicators, call analyze_prices with the scripcode instead of copying these numbers.",
+    inputSchema: { type: "object", properties: { scripcode: { type: "string" } }, required: ["scripcode"] },
+    async run({ scripcode }) { return priceHistory(code(scripcode)); },
   },
   {
     name: "get_financials",
@@ -560,16 +820,36 @@ const TOOLS = [
   },
   {
     name: "analyze_prices",
-    description: "Technical indicators on a daily closing-price series, oldest first (e.g. from an NSE price-history tool): returns over 1w-5y, CAGR, annualised volatility, max drawdown, SMA 20/50/200, EMA 12/26, MACD(12,26,9), RSI(14), Bollinger(20,2), 52-week range position and the SMA50/200 trend. closes: numbers; dates: optional matching dates (YYYY-MM-DD). ~260 closes covers all but 3y/5y returns.",
-    inputSchema: { type: "object", properties: { closes: { type: "array", items: { type: "number" } }, dates: { type: "array", items: { type: "string" } } }, required: ["closes"] },
-    async run({ closes, dates }) {
-      return { ...technicals(closes, dates ?? null), definitions: TECHNICAL_DEFINITIONS,
-        note: "Computed on the closes given (oldest first). Indicators describe past prices; they are not forecasts or advice. Further reading: Zerodha Varsity, Technical Analysis https://zerodha.com/varsity/module/technical-analysis/" };
+    description: "Technical indicators on daily prices. Either pass scripcode to use BSE's daily closes and volumes for the last 12 months, or pass your own daily series oldest first (e.g. candles from NSE's price-history MCP server): closes, plus dates, highs, lows, volumes. Gives returns, CAGR, volatility, max drawdown, SMA 20/50/200, EMA 12/26/50, MACD, RSI(14), Bollinger(20,2), 52-week position, SMA50/200 trend, recent swing highs/lows, Fibonacci levels, RSI divergence, volume vs its 20-day average, and price_jumps (possible unadjusted splits); with highs and lows also ATR(14), ADX/DI, stochastic, chandelier exit and classic pivots. timeframe='weekly' rebuilds weekly bars from the daily series. entry_date (+ side long/short) adds trailing-stop levels since entry: ATR trail, chandelier, latest swing low/high. About 260 daily bars covers everything except 3y/5y returns.",
+    inputSchema: { type: "object", properties: { scripcode: { type: "string", description: "BSE code: use BSE's daily closes and volumes for the last 12 months instead of passing a series" },
+      closes: { type: "array", items: { type: "number" } }, dates: { type: "array", items: { type: "string" } },
+      highs: { type: "array", items: { type: "number" } }, lows: { type: "array", items: { type: "number" } }, volumes: { type: "array", items: { type: "number" } },
+      timeframe: { type: "string", enum: ["daily", "weekly"], default: "daily" }, entry_date: { type: "string" }, side: { type: "string", enum: ["long", "short"], default: "long" } } },
+    async run({ closes, dates, highs, lows, volumes, timeframe = "daily", entry_date = null, side = "long", scripcode }) {
+      let source = "the series passed in, oldest first";
+      if (scripcode) {
+        if ([closes, dates, highs, lows, volumes].some((v) => v != null)) throw new ToolFail("pass either scripcode (BSE's daily closes for the last 12 months) or your own series, not both");
+        const h = await priceHistory(code(scripcode));
+        ({ closes, dates, volumes } = h);
+        source = `BSE's daily closes and volumes for ${h.scripcode}, ${h.from} to ${h.to}. BSE gives no daily highs and lows here, so ATR, ADX, stochastic, chandelier and pivots need daily candles from another source.`;
+      } else if (closes == null) throw new ToolFail("pass closes (oldest first), or scripcode to use BSE's daily closes for the last 12 months");
+      return { ...technicals(closes, dates ?? null, highs ?? null, lows ?? null, volumes ?? null, timeframe, entry_date, side), source, definitions: TECHNICAL_DEFINITIONS,
+        note: "Indicators describe past prices; they are not forecasts or advice. Further reading: Zerodha Varsity, Technical Analysis https://zerodha.com/varsity/module/technical-analysis/" };
     },
+  },
+  {
+    name: "position_size",
+    description: "Position size, risk/reward and Indian trading costs for one trade. capital (Rs), entry, and either stop or atr (+ atr_multiplier, default 2) to place the stop from volatility. risk_pct of capital (default 1), side long/short, optional target, leverage, max_position_pct (single-stock cap, default 20), win_rate and avg_win_loss for expected value and Kelly, segment delivery/intraday, exchange NSE/BSE, your broker's brokerage_per_order / brokerage_pct / dp_charge. Returns shares, which limit decided them, loss at stop and gain at target net of STT, exchange, SEBI, stamp duty, brokerage and GST, net reward:risk, breakeven move and Kelly fractions.",
+    inputSchema: { type: "object", properties: { capital: { type: "number" }, entry: { type: "number" }, stop: { type: "number" }, side: { type: "string", enum: ["long", "short"], default: "long" },
+      risk_pct: { type: "number", default: 1 }, atr: { type: "number" }, atr_multiplier: { type: "number", default: 2 }, target: { type: "number" }, leverage: { type: "number", default: 1 },
+      max_position_pct: { type: "number", default: 20 }, win_rate: { type: "number" }, avg_win_loss: { type: "number" }, segment: { type: "string", enum: ["delivery", "intraday"], default: "delivery" },
+      exchange: { type: "string", enum: ["NSE", "BSE"], default: "NSE" }, brokerage_per_order: { type: "number", default: 0 }, brokerage_pct: { type: "number", default: 0 },
+      dp_charge: { type: "number", default: 0 }, exchange_txn_rate: { type: "number" } }, required: ["capital", "entry"] },
+    async run(args) { return positionSize(args); },
   },
 ];
 
-const SERVER_INFO = { name: "bse", version: "0.2.0" };
+const SERVER_INFO = { name: "bse", version: "0.3.0" };
 const INSTRUCTIONS = "Live data from BSE India (Bombay Stock Exchange) by scrip code. Start with search_scrips when you only have a company name; the 5-6 digit code it returns is what every other tool takes. Amounts from get_financials are as BSE labels them (Rs million for most companies, as originally filed). Unofficial: not affiliated with BSE.";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -621,4 +901,4 @@ async function handle(m, origin) {
 }
 
 // Exported for tests (worker/test/worker.test.mjs); Cloudflare only uses the default export.
-export { rsi, maxDrawdown, emaSeries, technicals, fundamentals };
+export { rsi, maxDrawdown, emaSeries, technicals, fundamentals, atr, adx, stochastic, swings, fibonacci, rsiDivergence, toWeekly, tradeCosts, positionSize };

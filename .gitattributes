@@ -1,0 +1,3 @@
+# The skills and their zips must be byte-identical on every OS (tests compare them).
+src/bse_mcp/skills/** text eol=lf
+*.zip binary

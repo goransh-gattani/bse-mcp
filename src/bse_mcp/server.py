@@ -2,6 +2,7 @@
 
     bse-mcp            run the server over stdio (what Claude Desktop / Claude Code launch)
     bse-mcp --diag     try every way of reaching BSE from this network and print what came back
+    bse-mcp setup      register with Claude Desktop and Claude Code, and install the trading skills
 """
 
 from __future__ import annotations
@@ -59,6 +60,9 @@ tools.get_quote.__doc__ = ("Live price and key facts for one BSE scrip: LTP, cha
 tools.get_market_depth.__doc__ = "Top-5 bids and asks (price and quantity) with totals for one BSE scrip."
 tools.get_peers.__doc__ = ("BSE's peer group for a scrip: each peer's code, LTP, change %, PE, PB, EPS, revenue and PAT "
                            "(Rs Cr), OPM, NPM, 52-week range and the quarter those results are from.")
+tools.get_price_history.__doc__ = ("Daily closing prices and traded quantity on BSE for one scrip over the last 12 months, oldest "
+                                   "first (dates, closes, volumes), from BSE's price chart. No daily open/high/low. For indicators, "
+                                   "call analyze_prices with the scripcode instead of copying these numbers.")
 tools.get_financials.__doc__ = ("Quarterly P&L from BSE's results filings, newest first, with derived EBITDA, margins and tax "
                                 "rate. quarters: how many to return (1-16). upto: the newest quarter to include, like "
                                 "'Q1 FY27'; by default the latest quarter BSE has results for is detected. Values are as "
@@ -84,14 +88,26 @@ tools.analyze_fundamentals.__doc__ = ("Computed fundamentals for a BSE scrip fro
                                       "structure as % of revenue, interest coverage, tax rate, other income as % of PBT, TTM totals and "
                                       "TTM growth, and TTM P/E and price/sales from the live price. quarters: how many to fetch "
                                       "(8 gives TTM and its growth). Use this instead of doing the arithmetic yourself.")
-tools.analyze_prices.__doc__ = ("Technical indicators on a daily closing-price series, oldest first (e.g. from an NSE price-history "
-                                "tool): returns over 1w-5y, CAGR, annualised volatility, max drawdown, SMA 20/50/200, EMA 12/26, "
-                                "MACD(12,26,9), RSI(14), Bollinger(20,2), 52-week range position and the SMA50/200 trend. "
-                                "closes: numbers; dates: optional matching dates (YYYY-MM-DD). ~260 closes covers all but 3y/5y returns.")
+tools.analyze_prices.__doc__ = ("Technical indicators on daily prices. Either pass scripcode to use BSE's daily closes and volumes for "
+                                "the last 12 months, or pass your own daily series oldest first (e.g. candles from NSE's price-history "
+                                "MCP server): closes, plus dates, highs, lows, volumes. Gives returns, CAGR, volatility, max drawdown, "
+                                "SMA 20/50/200, EMA 12/26/50, MACD, RSI(14), Bollinger(20,2), 52-week position, SMA50/200 trend, recent "
+                                "swing highs/lows, Fibonacci levels, RSI divergence, volume vs its 20-day average, and price_jumps "
+                                "(possible unadjusted splits); with highs and lows also ATR(14), ADX/DI, stochastic, chandelier exit and "
+                                "classic pivots. timeframe='weekly' rebuilds weekly bars from the daily series. entry_date (+ side "
+                                "long/short) adds trailing-stop levels since entry: ATR trail, chandelier, latest swing low/high. "
+                                "About 260 daily bars covers everything except 3y/5y returns.")
+tools.position_size.__doc__ = ("Position size, risk/reward and Indian trading costs for one trade. capital (Rs), entry, and either "
+                               "stop or atr (+ atr_multiplier, default 2) to place the stop from volatility. risk_pct of capital "
+                               "(default 1), side long/short, optional target, leverage, max_position_pct (single-stock cap, "
+                               "default 20), win_rate and avg_win_loss for expected value and Kelly, segment delivery/intraday, "
+                               "exchange NSE/BSE, your broker's brokerage_per_order / brokerage_pct / dp_charge. Returns shares, "
+                               "which limit decided them, loss at stop and gain at target net of STT, exchange, SEBI, stamp duty, "
+                               "brokerage and GST, net reward:risk, breakeven move and Kelly fractions.")
 
-for _fn in (tools.search_scrips, tools.get_quote, tools.get_market_depth, tools.get_peers, tools.get_financials,
+for _fn in (tools.search_scrips, tools.get_quote, tools.get_market_depth, tools.get_peers, tools.get_price_history, tools.get_financials,
             tools.get_announcements, tools.download_announcement_pdf, tools.list_scrips, tools.call_bse_api,
-            tools.analyze_fundamentals, tools.analyze_prices):
+            tools.analyze_fundamentals, tools.analyze_prices, tools.position_size):
     _tool(_fn)
 
 
@@ -101,9 +117,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=f"bse-mcp {__version__}")
     parser.add_argument("--diag", action="store_true", help="try every way of reaching BSE from this network, print the results, and exit")
     sub = parser.add_subparsers(dest="cmd")
-    setup = sub.add_parser("setup", help="register this server with Claude Desktop and Claude Code")
+    setup = sub.add_parser("setup", help="register this server with Claude Desktop and Claude Code, and install the trading skills")
     setup.add_argument("--no-desktop", action="store_true", help="don't touch the Claude Desktop config")
-    setup.add_argument("--no-code", action="store_true", help="don't register with Claude Code")
+    setup.add_argument("--no-code", action="store_true", help="don't touch Claude Code (no server registration, no skills)")
+    setup.add_argument("--no-skills", action="store_true", help="don't install the trading skills into Claude Code")
     args = parser.parse_args(argv)
     if args.diag:
         print(bse.diagnose())
@@ -111,7 +128,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "setup":
         from . import setup_claude
         try:
-            for line in setup_claude.run(desktop=not args.no_desktop, code=not args.no_code):
+            for line in setup_claude.run(desktop=not args.no_desktop, code=not args.no_code, skills=not (args.no_code or args.no_skills)):
                 print(line)
         except setup_claude.SetupError as exc:
             print(f"bse-mcp setup: {exc}", file=sys.stderr)

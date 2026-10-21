@@ -56,3 +56,29 @@ def test_empty_file_is_treated_as_new(tmp_path):
     cfg = tmp_path / "claude_desktop_config.json"
     cfg.write_text("  \n")
     assert S.add_to_desktop_config(cfg, "/bin/bse-mcp") == "added"
+
+
+def test_install_skills_adds_then_leaves_alone_then_repairs(tmp_path):
+    dest = tmp_path / "skills"
+    states = S.install_skills(dest)
+    assert len(states) == 9 and set(states.values()) == {"added"}
+    toolkit = dest / "bse-mcp-trading-toolkit"
+    assert (toolkit / "SKILL.md").read_bytes() == (S.SKILLS / "bse-mcp-trading-toolkit" / "SKILL.md").read_bytes()
+    assert set(S.install_skills(dest).values()) == {"unchanged"}
+    (toolkit / "SKILL.md").write_text("edited")
+    (toolkit / "stray.txt").write_text("left over")
+    (dest / "my-own-skill").mkdir()
+    states = S.install_skills(dest)
+    assert states["bse-mcp-trading-toolkit"] == "updated" and list(states.values()).count("unchanged") == 8
+    assert not (toolkit / "stray.txt").exists() and (toolkit / "SKILL.md").read_text(encoding="utf-8").startswith("---\nname: bse-mcp-trading-toolkit")
+    assert (dest / "my-own-skill").is_dir()  # other skills are never touched
+
+
+def test_skills_go_where_claude_code_looks(tmp_path, monkeypatch):
+    monkeypatch.setattr(S.shutil, "which", lambda name: None)
+    assert S.add_skills_to_claude_code(tmp_path) == ["Claude Code skills: Claude Code not found, skipped"]
+    (tmp_path / ".claude").mkdir()
+    first = S.add_skills_to_claude_code(tmp_path)
+    assert first[0].startswith("Claude Code skills: 9 added (bse-mcp-*) in ") and "/reload-skills" in first[1]
+    assert len(list((tmp_path / ".claude" / "skills").glob("bse-mcp-*/SKILL.md"))) == 9
+    assert S.add_skills_to_claude_code(tmp_path) == [f"Claude Code skills: 9 unchanged (bse-mcp-*) in {tmp_path / '.claude' / 'skills'}"]

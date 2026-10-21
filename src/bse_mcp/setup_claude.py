@@ -1,9 +1,13 @@
-"""`bse-mcp setup`: register this server with Claude Desktop and Claude Code.
+"""`bse-mcp setup`: register this server with Claude Desktop and Claude Code, and install the skills.
 
 Claude Desktop reads its servers from claude_desktop_config.json. We add (or update) one entry,
 "bse", pointing at the absolute path of this command, and leave everything else in the file as it
 was. The old file is kept next to it as .bak. A file that isn't valid JSON is never overwritten:
 we stop and say so, because guessing would lose the user's other servers.
+
+The trading skills shipped in this package (skills/bse-mcp-*) are copied into Claude Code's
+personal skills folder, replacing earlier copies of the same skills. The Claude app takes skills
+as uploaded zips instead (skill-zips/ in the repo).
 """
 
 from __future__ import annotations
@@ -13,9 +17,12 @@ import os
 import shutil
 import subprocess
 import sys
+from collections import Counter
 from pathlib import Path
 
 SERVER_NAME = "bse"
+SKILLS = Path(__file__).parent / "skills"
+SKILL_ZIPS_URL = "https://github.com/goransh-gattani/bse-mcp/tree/main/skill-zips"
 
 
 class SetupError(RuntimeError):
@@ -90,7 +97,47 @@ def add_to_claude_code(command: str) -> str:
     return "Claude Code: registered (user scope)"
 
 
-def run(desktop: bool = True, code: bool = True) -> list[str]:
+def packaged_skills(root: Path = SKILLS) -> list[Path]:
+    skills = sorted(p for p in root.iterdir() if (p / "SKILL.md").is_file()) if root.is_dir() else []
+    if not skills:
+        raise SetupError(f"no skills found in {root}; reinstall bse-mcp")
+    return skills
+
+
+def _files(root: Path) -> dict[str, bytes]:
+    return {p.relative_to(root).as_posix(): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
+
+
+def install_skills(dest: Path, root: Path = SKILLS) -> dict[str, str]:
+    """Copy each packaged skill folder into dest. Returns {skill name: 'added' | 'updated' | 'unchanged'}."""
+    dest.mkdir(parents=True, exist_ok=True)
+    states = {}
+    for skill in packaged_skills(root):
+        target = dest / skill.name
+        if target.is_dir() and _files(target) == _files(skill):
+            states[skill.name] = "unchanged"
+            continue
+        states[skill.name] = "updated" if target.exists() else "added"
+        if target.exists():
+            shutil.rmtree(target)  # ours (bse-mcp-*): replaced whole, so files dropped from a skill don't linger
+        shutil.copytree(skill, target)
+    return states
+
+
+def add_skills_to_claude_code(home: Path | None = None) -> list[str]:
+    """Install the skills into Claude Code's personal skills folder, if Claude Code is on this machine."""
+    dest = (home or Path.home()) / ".claude" / "skills"
+    if not dest.parent.is_dir() and not shutil.which("claude"):
+        return ["Claude Code skills: Claude Code not found, skipped"]
+    existed = dest.is_dir()
+    counts = Counter(install_skills(dest).values())
+    lines = [f"Claude Code skills: {', '.join(f'{n} {state}' for state, n in sorted(counts.items()))} (bse-mcp-*) in {dest}"]
+    if not existed:
+        lines.append("  -> in a Claude Code session that was already open, run /reload-skills")
+    return lines
+
+
+def run(desktop: bool = True, code: bool = True, skills: bool = True) -> list[str]:
     command = command_path()
     lines = [f"bse-mcp command: {command}"]
     if desktop:
@@ -101,4 +148,7 @@ def run(desktop: bool = True, code: bool = True) -> list[str]:
             lines.append("  -> quit Claude Desktop completely (Cmd+Q / File > Exit) and reopen it to load the tools")
     if code:
         lines.append(add_to_claude_code(command))
+    if skills:
+        lines.extend(add_skills_to_claude_code())
+        lines.append(f"Claude app skills: upload the zips from {SKILL_ZIPS_URL} under Customize > Skills > + > Create skill > Upload a skill")
     return lines

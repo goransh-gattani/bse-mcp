@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bse-mcp"
-version = "0.2.0"
-description = "MCP server that gives Claude live BSE India (Bombay Stock Exchange) data by scrip code. Unofficial."
+version = "0.3.0"
+description = "MCP server that gives Claude live BSE India (Bombay Stock Exchange) data by scrip code, with trading-analysis skills. Unofficial."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -33,6 +33,9 @@ Issues = "https://github.com/goransh-gattani/bse-mcp/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+bse_mcp = ["skills/*/*"]   # the trading skills `bse-mcp setup` installs
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
