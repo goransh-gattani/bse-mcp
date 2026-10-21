@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bse-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server that gives Claude live BSE India (Bombay Stock Exchange) data by scrip code. Unofficial."
 readme = "README.md"
 license = { text = "MIT" }

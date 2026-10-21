@@ -12,7 +12,9 @@ Unofficial. Not affiliated with BSE. It reads the same public endpoints the bsei
 | `get_quote(scripcode)` | LTP and change, day / 52-week ranges, price band, volume, delivery %, market cap, EPS / PE / PB / ROE / margins (standalone and consolidated), group, sector, flags (ASM/GSM). |
 | `get_market_depth(scripcode)` | Top-5 bids and asks with totals. |
 | `get_peers(scripcode)` | BSE's peer table: price, PE, PB, revenue, PAT, margins, 52-week range. |
-| `get_financials(scripcode, quarters=5, upto=None)` | Quarterly P&L as filed, newest first, quarters named `Q1 FY27`; derived EBITDA, EBITDA / PBT / PAT margins and tax rate. The latest filed quarter is detected automatically. |
+| `get_financials(scripcode, quarters=5, upto=None)` | Quarterly P&L as filed, newest first, each quarter labelled by its months (`Apr–Jun 2026`) and by Indian FY (`Q1 FY27`); derived EBITDA, EBITDA / PBT / PAT margins and tax rate. The latest filed quarter is detected automatically. |
+| `analyze_fundamentals(scripcode, quarters=8)` | Computed from the filings: YoY and QoQ growth (matched by period), margins and margin change, cost structure, interest coverage, tax rate, other income as % of PBT, TTM totals and TTM growth, TTM P/E and price/sales. The filing unit is checked against BSE's Rs-crore results card instead of assumed. |
+| `analyze_prices(closes, dates=None)` | Technical indicators on a daily price series, e.g. from NSE's history MCP: returns 1w–5y, CAGR, volatility, max drawdown, SMA 20/50/200, EMA 12/26, MACD, RSI(14), Bollinger(20,2), 52-week position, SMA50/200 trend. |
 | `get_announcements(scripcode, months=12, category="all", page=1)` | Filings from BSE's announcements feed with PDF links; `category="results"` for financial results only. |
 | `download_announcement_pdf(attachment, save_dir, filename=None)` | Saves a filing's PDF (Python server only). |
 | `list_scrips(segment, status, group, name_contains, scripcode, limit)` | BSE's List of Securities, filtered. |
@@ -87,10 +89,17 @@ A demo instance runs at `https://bse-proxy.goransh-gattani.workers.dev/mcp` (add
 
 The tools answer with the cause: `BSE refused ... (HTTP 403)`. From a computer run `bse-mcp --diag`; it tries each HTTP client (curl_cffi with Chrome's TLS fingerprint, urllib, curl) against BSE and prints what came back. Installing `curl_cffi` fixes most refusals. From a Worker, BSE is blocking Cloudflare at the moment; retry later or use the Python server.
 
+## How the calculations are done
+
+Each analysis result carries a `definitions` block saying exactly what every figure is, so answers can be checked. In brief: EBITDA is revenue less materials, stock-in-trade purchases, inventory change, employee and other expenses; EBIT is PBT plus finance costs; TTM is the latest four consecutive quarters; YoY compares with the quarter ending 12 months earlier, found by date rather than by position; growth off a zero or negative base is left blank rather than reported as a meaningless percentage. RSI is Wilder's (checked against StockCharts' published worked example), EMAs are SMA-seeded, Bollinger bands use the population standard deviation. EV/EBITDA, P/B, ROCE and debt ratios are not computed: BSE's results endpoints give the P&L only, and the tool says so instead of estimating.
+
+The formulas are the standard ones. For background on what they mean and how analysts use them, see Zerodha Varsity's [Fundamental Analysis](https://zerodha.com/varsity/module/fundamental-analysis/) and [Technical Analysis](https://zerodha.com/varsity/module/technical-analysis/) modules (Varsity's text is Zerodha's copyright and is not reproduced here).
+
 ## Data and terms
 
 - Figures are what BSE publishes: quotes are delayed as BSE delays them; financials are as originally filed (later restatements are not applied) and labelled Rs million by BSE for most companies; derived rows (EBITDA, margins) are computed here and marked as such.
-- The quarter-id scheme (126 = Jun-25, one step per quarter) was verified on one company's filings; quarter names in results are taken from BSE's own period-end dates, so they stay right even if the scheme drifts.
+- The quarter-id scheme (126 = Jun-25, one step per quarter) was verified on one company's filings; quarter names in results are taken from BSE's own period dates, so they stay right even if the scheme drifts. `quarter` names the Indian April–March FY quarter; for companies with another financial year (ABB India reports January–December) use `period`, which gives the months.
+- Indicators and ratios describe past figures. They are not forecasts or investment advice.
 - The data belongs to BSE and its use is governed by [BSE's terms](https://www.bseindia.com/). This project only fetches it for you, the way your browser would; it grants no rights to redistribute it. Not investment advice.
 
 ## Development

@@ -79,8 +79,19 @@ tools.call_bse_api.__doc__ = ("Call any documented BSE endpoint and return its r
                               + ", ".join(bse.ENDPOINTS) + ". Default params are filled from scripcode and quarter (a BSE "
                               "quarter id like '130.00', or 'Q1 FY27'); anything in params overrides them.")
 
+tools.analyze_fundamentals.__doc__ = ("Computed fundamentals for a BSE scrip from its quarterly filings: revenue, EBITDA, PBT, PAT, EPS "
+                                      "with YoY and QoQ growth (matched by period, not by position), margins and margin change, cost "
+                                      "structure as % of revenue, interest coverage, tax rate, other income as % of PBT, TTM totals and "
+                                      "TTM growth, and TTM P/E and price/sales from the live price. quarters: how many to fetch "
+                                      "(8 gives TTM and its growth). Use this instead of doing the arithmetic yourself.")
+tools.analyze_prices.__doc__ = ("Technical indicators on a daily closing-price series, oldest first (e.g. from an NSE price-history "
+                                "tool): returns over 1w-5y, CAGR, annualised volatility, max drawdown, SMA 20/50/200, EMA 12/26, "
+                                "MACD(12,26,9), RSI(14), Bollinger(20,2), 52-week range position and the SMA50/200 trend. "
+                                "closes: numbers; dates: optional matching dates (YYYY-MM-DD). ~260 closes covers all but 3y/5y returns.")
+
 for _fn in (tools.search_scrips, tools.get_quote, tools.get_market_depth, tools.get_peers, tools.get_financials,
-            tools.get_announcements, tools.download_announcement_pdf, tools.list_scrips, tools.call_bse_api):
+            tools.get_announcements, tools.download_announcement_pdf, tools.list_scrips, tools.call_bse_api,
+            tools.analyze_fundamentals, tools.analyze_prices):
     _tool(_fn)
 
 

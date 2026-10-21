@@ -6,7 +6,8 @@ import pytest
 from bse_mcp import server as S
 
 EXPECTED = ["search_scrips", "get_quote", "get_market_depth", "get_peers", "get_financials",
-            "get_announcements", "download_announcement_pdf", "list_scrips", "call_bse_api"]
+            "get_announcements", "download_announcement_pdf", "list_scrips", "call_bse_api",
+            "analyze_fundamentals", "analyze_prices"]
 
 
 def run(coro):

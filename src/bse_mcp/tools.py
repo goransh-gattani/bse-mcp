@@ -113,6 +113,16 @@ def derived(lines: dict) -> dict:
             "tax_rate": pct(-tax if tax is not None else None, pbt), "pat_margin": pct(pat, sales)}
 
 
+def period_label(begin: str | None, end: str | None) -> str | None:
+    """'01-Apr-26', '30-Jun-26' -> 'Apr–Jun 2026': the months the figures cover, whatever the company's FY."""
+    rx = r"\d+-(\w{3})-(\d{2})"
+    b, e = re.fullmatch(rx, begin or ""), re.fullmatch(rx, end or "")
+    if not b or not e or b.group(1) not in MONTHS or e.group(1) not in MONTHS:
+        return None
+    by, ey = 2000 + int(b.group(2)), 2000 + int(e.group(2))
+    return f"{b.group(1)}–{e.group(1)} {ey}" if by == ey else f"{b.group(1)} {by}–{e.group(1)} {ey}"
+
+
 def detailed_result(code: str, qid: int) -> dict | None:
     """One quarter's P&L, or None when BSE has no filing for that quarter id."""
     data = bse.get("Corp_detailedResult_Transpose_ng", {"Scrip_cd": code, "Qtr": f"{qid:.2f}"})
@@ -121,9 +131,11 @@ def detailed_result(code: str, qid: int) -> dict | None:
         return None
     meta = {r["fld_desc"]: r.get("Value") for r in rows if r.get("Header") == "2"}
     lines = {r["fld_desc"]: _num(r.get("Value")) for r in rows if r.get("Header") != "2"}
-    end = meta.get("Date End", "")
-    return {"quarter": label_from_end(end) or quarter_label(qid), "bse_quarter_id": f"{qid:.2f}",
-            "period_begin": meta.get("Date Begin"), "period_end": end, "type": meta.get("Type"), "lines": lines}
+    if not any(v is not None for v in lines.values()):
+        return None  # BSE answers a quarter that isn't filed yet with empty meta rows only
+    begin, end = meta.get("Date Begin", ""), meta.get("Date End", "")
+    return {"quarter": label_from_end(end) or quarter_label(qid), "period": period_label(begin, end),
+            "bse_quarter_id": f"{qid:.2f}", "period_begin": begin, "period_end": end, "type": meta.get("Type"), "lines": lines}
 
 
 def plain(text: str) -> str:
@@ -200,7 +212,9 @@ def get_peers(scripcode: str) -> list[dict]:
     return [{k: r.get(k) for k in keys} for r in rows]
 
 
-FINANCIALS_NOTE = ("Amounts as filed with BSE (Rs million unless the company reports otherwise); expenses negative. "
+FINANCIALS_NOTE = ("'quarter' names the quarter in the Indian April-March financial year; 'period' gives the months the figures "
+                   "cover, which is what to use for companies with another financial year (ABB India, for one, reports Jan-Dec). "
+                   "Amounts as filed with BSE (Rs million unless the company reports otherwise); expenses negative. "
                    "derived.* are computed here: ebitda = sales + materials + stock-in-trade purchases + inventory change + employee + other expenses.")
 
 
@@ -296,3 +310,44 @@ def call_bse_api(endpoint: str, params: dict | None = None, scripcode: str = "",
     filled = {k: v.replace("{scripcode}", str(scripcode).strip()).replace("{quarter}", qid) for k, v in ENDPOINTS[endpoint][2].items()}
     filled.update({k: str(v) for k, v in (params or {}).items()})
     return bse.get(endpoint, filled)
+
+
+# ---------------------------------------------------------------- analysis
+def analyze_fundamentals(scripcode: str, quarters: int = 8) -> dict:
+    from . import analysis
+
+    code = _code(scripcode)
+    n = max(1, min(16, int(quarters)))
+    fin = get_financials(code, quarters=n)
+    qs = fin["quarters"]
+    if not qs:
+        raise BseError(f"BSE returned no quarterly results for {code}")
+    out = analysis.fundamentals(qs)
+    head = bse.get("getScripHeaderData", {"Debtflag": "", "scripcode": code, "seriesid": ""})
+    trade = bse.get("StockTrading", {"flag": "", "quotetype": "EQ", "scripcode": code})
+    card = bse.get("TabResults_PAR_RESULTS", {"scripcode": code, "tabtype": "RESULTS"})
+    h, cur = head.get("Header") or {}, head.get("CurrRate") or {}
+    price = _num(h.get("LTP") or cur.get("LTP"))
+    latest = out["quarters"][0] if out["quarters"] else None
+    unit = analysis.unit_factor(latest["metrics"]["revenue"] if latest else None, card if isinstance(card, dict) else None,
+                                latest["period_end"] if latest else None)
+    out["valuation"] = analysis.valuation(out["ttm"], price, _num(trade.get("MktCapFull")), unit["crore_per_unit"])
+    com = bse.get("ComHeadernew_par", {"quotetype": "", "scripcode": code, "seriesid": ""})
+    out["valuation"]["bse_reported"] = {"pe": _num(com.get("PE")), "eps": _num(com.get("EPS")),
+                                        "note": "BSE's own P/E and EPS; their EPS basis (e.g. annual, including discontinued items) can differ from TTM continuing EPS"}
+    return {"scripcode": code, "unit": unit, **out, "definitions": analysis.FUNDAMENTAL_DEFINITIONS,
+            "note": "Figures are standalone as filed with BSE; amounts in the filed unit (see 'unit') unless the key ends in _cr. "
+                    "Further reading on these ratios: Zerodha Varsity, Fundamental Analysis https://zerodha.com/varsity/module/fundamental-analysis/"}
+
+
+def analyze_prices(closes: list[float], dates: list[str] | None = None) -> dict:
+    from . import analysis
+
+    try:
+        out = analysis.technicals(closes, dates)
+    except ValueError as exc:
+        raise ArgError(str(exc)) from None
+    out["definitions"] = analysis.TECHNICAL_DEFINITIONS
+    out["note"] = ("Computed on the closes given (oldest first). Indicators describe past prices; they are not forecasts or advice. "
+                   "Further reading: Zerodha Varsity, Technical Analysis https://zerodha.com/varsity/module/technical-analysis/")
+    return out

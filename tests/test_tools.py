@@ -63,9 +63,11 @@ def test_market_depth_and_peers(fake):
 
 def test_financials_detects_latest_and_skips_unfiled(fake):
     fin = tools.get_financials("500002", quarters=5)
-    assert [x["quarter"] for x in fin["quarters"]] == ["Q1 FY27", "Q4 FY26", "Q1 FY26"]
+    assert [x["quarter"] for x in fin["quarters"]] == ["Q1 FY27", "Q4 FY26", "Q3 FY26", "Q2 FY26", "Q1 FY26"]
+    assert fin["quarters"][0]["period"] == "Apr–Jun 2026"
     probes = [q["Qtr"] for q in fake.sent("Corp_detailedResult_Transpose_ng")]
     assert probes[:2] == ["131.00", "130.00"], "probes one quarter ahead of the results link first"
+    assert all(q["lines"] for q in fin["quarters"]), "BSE's empty placeholder for unfiled 131.00 must not appear as a quarter"
     q1 = fin["quarters"][0]
     assert q1["period_end"] == "30-Jun-26" and q1["lines"]["Net Sales/Revenue From Operations"] == 35588.7
     assert q1["derived"] == {"ebitda": 4470.4, "ebitda_margin": 0.1256, "pbt_margin": 0.1401, "tax_rate": 0.258, "pat_margin": 0.104}

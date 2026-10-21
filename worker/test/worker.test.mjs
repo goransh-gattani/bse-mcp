@@ -1,5 +1,5 @@
 // Run with:  node --test worker/test/worker.test.mjs   (from the repo root). BSE answers come from fixtures.json.
-import w from "../worker.js";
+import w, { rsi, maxDrawdown } from "../worker.js";
 import fs from "node:fs";
 const F = JSON.parse(fs.readFileSync(new URL("./fixtures.json", import.meta.url), "utf8"));
 const calls = []; let fail = new Set();
@@ -30,7 +30,7 @@ check(r.status === 200 && j.result.protocolVersion === "2025-03-26" && j.result.
 r = await rpc({ jsonrpc: "2.0", method: "notifications/initialized" });
 check(r.status === 202, "notification -> 202");
 r = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }); j = await r.json();
-check(j.result.tools.length === 8 && j.result.tools.every((t) => t.name && t.description && t.inputSchema.type === "object"), `tools/list (${j.result.tools.map((t) => t.name).join(",")})`);
+check(j.result.tools.length === 10 && j.result.tools.every((t) => t.name && t.description && t.inputSchema.type === "object"), `tools/list (${j.result.tools.map((t) => t.name).join(",")})`);
 r = await rpc({ jsonrpc: "2.0", id: 3, method: "nope" }); j = await r.json(); check(j.error && j.error.code === -32601, "unknown method -> -32601");
 r = await w.fetch(new Request(W + "/mcp", { method: "POST", body: "{bad" }), env); check((await r.json()).error.code === -32700, "parse error");
 r = await w.fetch(new Request(W + "/mcp"), env); check(r.status === 405, "GET /mcp -> 405");
@@ -47,7 +47,8 @@ let p = text(await call("get_peers", { scripcode: "500002" }));
 check(p.length === 4 && p.some((x) => /Hitachi/.test(x.Name)), "peers");
 calls.length = 0;
 let f = text(await call("get_financials", { scripcode: "500002", quarters: 5 }));
-check(f.quarters.map((x) => x.quarter).join(",") === "Q1 FY27,Q4 FY26,Q1 FY26", `financials auto latest + skip unfiled (${f.quarters.map((x) => x.quarter)})`);
+check(f.quarters.map((x) => x.quarter).join(",") === "Q1 FY27,Q4 FY26,Q3 FY26,Q2 FY26,Q1 FY26", `financials auto latest + skip unfiled (${f.quarters.map((x) => x.quarter)})`);
+check(f.quarters[0].period === "Apr–Jun 2026" && f.quarters.every((x) => Object.keys(x.lines).length), "period label; BSE's empty placeholder for 131 is not a quarter");
 check(f.quarters[0].derived.ebitda === 4470.4 && f.quarters[0].derived.ebitda_margin === 0.1256 && f.quarters[0].derived.tax_rate === 0.258, `derived (${JSON.stringify(f.quarters[0].derived)})`);
 check(calls.some(([n, qq]) => n === "Corp_detailedResult_Transpose_ng" && qq.Qtr === "131.00"), "probed one quarter ahead of the results link");
 f = text(await call("get_financials", { scripcode: "500002", quarters: 1, upto: "Q4 FY26" }));
@@ -70,6 +71,33 @@ fail.add("getScripHeaderData");
 e = await call("get_quote", { scripcode: "500002" });
 check(e.isError && /403/.test(e.content[0].text) && /pip install bse-mcp/.test(e.content[0].text), "403 -> isError with remedy");
 fail.clear();
+
+// ---- analysis tools: same expectations as tests/test_analysis.py
+let fa = text(await call("analyze_fundamentals", { scripcode: "500002", quarters: 8 }));
+let la = fa.quarters[0];
+check(fa.unit.unit === "Rs million" && la.metrics.ebitda === 4470.4 && la.metrics.interest_coverage === 292.68 && la.metrics.other_income_share_of_pbt === 0.1858, `fundamentals metrics (${JSON.stringify(la.metrics).slice(0, 120)})`);
+check(JSON.stringify(la.metrics.cost_structure) === JSON.stringify({ materials: 0.5961, employee: 0.0705, other_expenses: 0.2078, depreciation: 0.011 }), "cost structure");
+check(JSON.stringify(la.yoy) === JSON.stringify({ revenue: 0.1207, ebitda: 0.0796, pbt: 0.052, pat: 0.0511, eps: 0.0505, ebitda_margin_change_pts: -0.48 }), `yoy (${JSON.stringify(la.yoy)})`);
+check(la.qoq.revenue === 0.1177 && fa.quarters.at(-1).yoy === null, "qoq; no yoy for the oldest");
+check(fa.ttm.available && fa.ttm.revenue === 136106.6 && fa.ttm.eps === 73.4 && fa.ttm.growth_vs_prior_ttm === null, `ttm (${JSON.stringify(fa.ttm).slice(0, 120)})`);
+check(fa.valuation.ttm_revenue_cr === 13610.66 && fa.valuation.pe_ttm === Math.round(6963 / 73.4 * 100) / 100 && fa.valuation.price_to_sales_ttm === Math.round(147551.8 / 13610.66 * 100) / 100 && fa.valuation.bse_reported.pe === 49.38, `valuation (${JSON.stringify(fa.valuation).slice(0, 160)})`);
+fa = text(await call("analyze_fundamentals", { scripcode: "500002", quarters: 2 }));
+check(fa.ttm.available === false && /4 consecutive/.test(fa.ttm.reason) && fa.valuation.available === false, "ttm needs 4 consecutive quarters");
+const RSI_CLOSES = [44.3389, 44.0902, 44.1497, 43.6124, 44.2779, 44.8264, 45.0955, 45.4245, 45.8433, 46.0826, 45.8931, 46.0328, 45.6140, 46.2820, 46.2820, 46.0028, 46.0328, 46.4116, 46.2222, 45.6439];
+const rsis = [15, 16, 17, 18, 19, 20].map((k) => Math.round(rsi(RSI_CLOSES.slice(0, k)) * 100) / 100);
+check(JSON.stringify(rsis) === JSON.stringify([70.53, 66.32, 66.55, 69.41, 66.36, 57.97]), `RSI matches StockCharts example (${rsis})`);
+const line = Array.from({ length: 250 }, (_, i) => i + 1);
+let ta = text(await call("analyze_prices", { closes: line }));
+check(Math.abs(ta.macd.macd - 7) < 1e-9 && Math.abs(ta.macd.signal - 7) < 1e-9 && ta.ema.ema_12 === 244.5 && ta.ema.ema_26 === 237.5 && ta.rsi_14 === 100 && /golden/.test(ta.trend.state), `macd/ema exact on a line (${JSON.stringify(ta.macd)})`);
+ta = text(await call("analyze_prices", { closes: Array.from({ length: 20 }, (_, i) => i + 1) }));
+check(ta.bollinger_20_2.middle === 10.5 && Math.abs(ta.bollinger_20_2.upper - (10.5 + 2 * Math.sqrt(399 / 12))) < 0.01 && Boolean(ta.needs_more_data), "bollinger population sd");
+check(JSON.stringify(maxDrawdown([100, 120, 90, 130], ["d0", "d1", "d2", "d3"])) === JSON.stringify({ drawdown: -0.25, peak: "d1", trough: "d2" }), "max drawdown");
+ta = text(await call("analyze_prices", { closes: [100, 121], dates: ["2024-01-01", "2026-01-01"] }));
+check(Math.abs(ta.cagr - 0.0998) < 1e-3, `cagr with dates (${ta.cagr})`);
+e = await call("analyze_prices", { closes: [1, 2, 3], dates: ["2026-01-03", "2026-01-02", "2026-01-01"] });
+check(e.isError && /oldest first/.test(e.content[0].text), "rejects descending dates");
+e = await call("analyze_prices", { closes: [1, -2, 3] });
+check(e.isError && /positive/.test(e.content[0].text), "rejects non-positive closes");
 // token
 r = await rpc({ jsonrpc: "2.0", id: 9, method: "ping" }, { env: { MCP_TOKEN: "s3cret" } }); check(r.status === 401, "MCP_TOKEN set: no token -> 401");
 r = await rpc({ jsonrpc: "2.0", id: 9, method: "ping" }, { env: { MCP_TOKEN: "s3cret" }, headers: { Authorization: "Bearer s3cret" } }); check(r.status === 200, "MCP_TOKEN set: right token -> 200");

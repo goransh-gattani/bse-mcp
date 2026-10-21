@@ -14,6 +14,9 @@ LINES = ["Net Sales/Revenue From Operations", "Other Income", "Total Income", "E
 Q = {  # values observed from Corp_detailedResult_Transpose_ng
     "130.00": ("Un-Audited", "01-Apr-26", "30-Jun-26", [35588.7, 926.7, 36515.4, -31527.7, 50.8, -17574.7, -392.3, -2509.7, -17.1, -7394.5, -3690.2, 4987.7, 4987.7, -1287.0, -1467.0, 180.0, 3700.7, 3623.0, 17.46, -0.37, 17.46, -0.37]),
     "129.00": ("Un-Audited", "01-Jan-26", "31-Mar-26", [31840.6, 996.4, 32837.0, -28218.3, 515.4, -16442.2, -423.6, -2528.6, -38.1, -6888.2, -2413.0, 4618.7, 4618.7, -1199.6, -1226.5, 26.9, 3419.1, 17836.5, 16.14, 68.04, 16.14, 68.04]),
+    # 128 and 127 as BSE returned them live on 19 Oct 2026 through the bse tools
+    "128.00": ("Audited", "01-Oct-25", "31-Dec-25", [35570.1, 763.3, 36333.4, -30557.5, -1516.5, -16466.3, -396.4, -2913.7, -53.5, -6496.4, -2714.7, 5775.9, 5775.9, -1432.7, -1362.8, -69.9, 4343.2, 4328.5, 20.5, -0.07, 20.5, -0.07]),
+    "127.00": ("Un-Audited", "01-Jul-25", "30-Sep-25", [33107.2, 839.5, 33946.7, -28525.6, 342.9, -17559.7, -365.9, -2222.5, -56.4, -6261.4, -2402.6, 5421.1, 5421.1, -1332.3, -1232.4, -99.9, 4088.8, 4090.4, 19.3, 0.01, 19.3, 0.01]),
     "126.00": ("Un-Audited", "01-Apr-25", "30-Jun-25", [31754.4, 997.5, 32751.9, -28010.8, 1479.1, -16598.3, -355.4, -2160.0, -41.9, -6989.5, -3344.8, 4741.1, 4741.1, -1220.3, -1088.0, -132.3, 3520.8, 3517.4, 16.62, -0.02, 16.62, -0.02]),
 }
 ANN = [{"SCRIP_CD": 500002, "SLONGNAME": "ABB India Ltd", "NEWS_DT": f"2026-10-{10-i:02d}T10:00:00", "HEADLINE": h_, "CATEGORYNAME": c_, "SUBCATNAME": c_,
@@ -25,7 +28,14 @@ ANN = [{"SCRIP_CD": 500002, "SLONGNAME": "ABB India Ltd", "NEWS_DT": f"2026-10-{
     ("Financial results Q1", "Result", "res2.pdf"),
     ("Analyst call intimation", "Company Update", "w6.pdf"),
     ("Annual report", "AGM/EGM", "w7.pdf")])]
+# A quarter that isn't filed yet: BSE answers with the meta rows only, all empty (seen live for 131.00 on
+# 19 Oct 2026). It must count as "not filed", not as a quarter with no numbers.
+PLACEHOLDER = {"131.00"}
+
+
 def detail(q):
+    if q in PLACEHOLDER:
+        return {"table1": [mk(0, "Type", "", "2"), mk(0, "Date Begin", "", "2"), mk(0, "Date End", "", "2")]}
     if q not in Q:
         return {"table1": []}
     typ, b, e, vals = Q[q]

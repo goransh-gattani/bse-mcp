@@ -154,8 +154,47 @@ async function detailedResult(sc, id) {
   if (!rows || !rows.length) return null;
   const meta = Object.fromEntries(rows.filter((r) => r.Header === "2").map((r) => [r.fld_desc, r.Value]));
   const lines = Object.fromEntries(rows.filter((r) => r.Header !== "2").map((r) => [r.fld_desc, num(r.Value)]));
-  const end = meta["Date End"] || "";
-  return { quarter: labelFromEnd(end) || quarterLabel(id), bse_quarter_id: id.toFixed(2), period_begin: meta["Date Begin"], period_end: end, type: meta.Type, lines };
+  if (!Object.values(lines).some((v) => v != null)) return null; // BSE answers an unfiled quarter with empty meta rows only
+  const begin = meta["Date Begin"] || "", end = meta["Date End"] || "";
+  return { quarter: labelFromEnd(end) || quarterLabel(id), period: periodLabel(begin, end), bse_quarter_id: id.toFixed(2), period_begin: begin, period_end: end, type: meta.Type, lines };
+}
+// '01-Apr-26', '30-Jun-26' -> 'Apr–Jun 2026': the months the figures cover, whatever the company's FY.
+function periodLabel(begin, end) {
+  const rx = /^\d+-(\w{3})-(\d{2})$/;
+  const b = rx.exec(begin || ""), e = rx.exec(end || "");
+  if (!b || !e || !MONTHS.includes(b[1]) || !MONTHS.includes(e[1])) return null;
+  const by = 2000 + +b[2], ey = 2000 + +e[2];
+  return by === ey ? `${b[1]}–${e[1]} ${ey}` : `${b[1]} ${by}–${e[1]} ${ey}`;
+}
+const FINANCIALS_NOTE = "'quarter' names the quarter in the Indian April-March financial year; 'period' gives the months the figures cover, which is what to use for companies with another financial year (ABB India, for one, reports Jan-Dec). Amounts as filed with BSE (Rs million unless the company reports otherwise); expenses negative. derived.* are computed here: ebitda = sales + materials + stock-in-trade purchases + inventory change + employee + other expenses.";
+
+async function financials(sc, n, upto) {
+  let latest;
+  if (upto) latest = quarterIdFor(upto);
+  else {
+    // The results tab links to the latest quarter; probe one ahead and a few behind in case that link lags.
+    const tab = await bseGet("TabResults_PAR_RESULTS", { scripcode: sc, tabtype: "RESULTS" });
+    const link = (tab && tab.resultinS && tab.resultinS[0] && tab.resultinS[0].LLQ) || "";
+    const m = /qtr=([\d.]+)/.exec(link);
+    const base = m ? Math.round(parseFloat(m[1])) : lastEndedQuarter();
+    const probes = [base + 1, base, base - 1, base - 2, base - 3];
+    const found = await Promise.all(probes.map((q) => detailedResult(sc, q)));
+    const i = found.findIndex(Boolean);
+    if (i < 0) throw new ToolFail(`BSE has no quarterly results for ${sc} around ${quarterLabel(base)}`);
+    latest = probes[i];
+  }
+  // Ask for n quarters plus a few spares at once; stop after 4 unfiled in a row.
+  const ids = Array.from({ length: n + 4 }, (_, i) => latest - i);
+  const res = await Promise.all(ids.map((q) => detailedResult(sc, q)));
+  const out = [];
+  let misses = 0;
+  for (const r of res) {
+    if (out.length >= n || misses >= 4) break;
+    if (!r) { misses++; continue; }
+    misses = 0;
+    out.push({ ...r, derived: derived(r.lines) });
+  }
+  return out;
 }
 const LINE = { sales: "Net Sales/Revenue From Operations", cmc: "Cost of Materials Consumed", purch: "Purchases of stock-in-trade",
   inv: "Changes in inventories of finished goods, work-in-progress and stock-in-trade", emp: "Employee benefit expense", oth: "Other Expenses",
@@ -171,6 +210,211 @@ function derived(lines) {
 const plain = (t) => String(t || "").replace(/<\s*br\s*\/?>/gi, "\n").replace(/<[^>]+>/g, "")
   .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ").replace(/\n{3,}/g, "\n\n").trim();
 const ymd = (d) => d.toISOString().slice(0, 10).replace(/-/g, "");
+
+
+// ======================================================================== analysis (mirrors src/bse_mcp/analysis.py)
+const rnd = (x, nd = 4) => (x == null || !Number.isFinite(x) ? null : Math.round(x * 10 ** nd) / 10 ** nd);
+const ratio = (a, b) => (a != null && b != null && b !== 0 ? a / b : null);
+const growth = (now, before) => (now != null && before != null && before > 0 ? now / before - 1 : null);
+const AL = { sales: "Net Sales/Revenue From Operations", other_income: "Other Income", cmc: "Cost of Materials Consumed",
+  purch: "Purchases of stock-in-trade", inv: "Changes in inventories of finished goods, work-in-progress and stock-in-trade",
+  emp: "Employee benefit expense", oth: "Other Expenses", dep: "Depreciation and amortisation expense", fin: "Finance Costs",
+  pbt: "Profit (+)/ Loss (-) from Ordinary Activities before Tax", tax: "Tax",
+  pat: "Net Profit (+)/ Loss (-) from Ordinary Activities after Tax", net: "Net Profit", eps: "Basic EPS for continuing operation" };
+const FUNDAMENTAL_DEFINITIONS = {
+  ebitda: "revenue + materials + stock-in-trade purchases + inventory change + employee cost + other expenses (operating profit before depreciation, interest, other income and tax)",
+  ebit: "PBT + finance costs (includes other income)",
+  interest_coverage: "EBIT / finance costs",
+  pat: "profit after tax from continuing operations",
+  net_profit: "reported net profit, including discontinued operations and other items",
+  eps: "basic EPS from continuing operations (Rs per share)",
+  tax_rate: "tax / PBT",
+  other_income_share_of_pbt: "other income / PBT: how much of profit comes from outside operations",
+  cost_structure: "each cost as a share of revenue; materials = materials consumed + stock-in-trade purchases + inventory change",
+  yoy: "change against the quarter ending 12 months earlier; qoq: against the quarter ending 3 months earlier. None when that quarter is missing or the base is zero or negative",
+  ttm: "sum of the latest 4 consecutive quarters (trailing twelve months); margins are TTM sums divided by TTM revenue",
+  pe_ttm: "share price / TTM EPS (continuing operations)",
+  price_to_sales_ttm: "market capitalisation / TTM revenue",
+};
+const GROWTH_KEYS = ["revenue", "ebitda", "pbt", "pat", "eps"];
+
+function quarterMetrics(lines) {
+  const g = (k) => (lines[AL[k]] ?? null);
+  const sales = g("sales");
+  const op = ["cmc", "purch", "inv", "emp", "oth"].map(g);
+  const ebitda = sales != null && op.every((c) => c != null) ? sales + op.reduce((a, b) => a + b, 0) : null;
+  const fin = g("fin") != null ? -g("fin") : null;
+  const pbt = g("pbt"), tax = g("tax");
+  const ebit = pbt != null && fin != null ? pbt + fin : null;
+  const mat = ["cmc", "purch", "inv"].every((k) => g(k) != null) ? g("cmc") + g("purch") + g("inv") : null;
+  const share = (v) => (v != null ? rnd(ratio(-v, sales)) : null);
+  return {
+    revenue: sales, other_income: g("other_income"), ebitda: rnd(ebitda, 2), ebit: rnd(ebit, 2), pbt, pat: g("pat"), net_profit: g("net"), eps: g("eps"),
+    finance_costs: fin, depreciation: g("dep") != null ? -g("dep") : null,
+    ebitda_margin: rnd(ratio(ebitda, sales)), pbt_margin: rnd(ratio(pbt, sales)), pat_margin: rnd(ratio(g("pat"), sales)),
+    tax_rate: rnd(ratio(tax != null ? -tax : null, pbt)),
+    interest_coverage: fin ? rnd(ratio(ebit, fin), 2) : null,
+    other_income_share_of_pbt: rnd(ratio(g("other_income"), pbt)),
+    cost_structure: { materials: share(mat), employee: share(g("emp")), other_expenses: share(g("oth")), depreciation: share(g("dep")) },
+  };
+}
+const monthIndex = (end) => { const m = /^\d+-(\w{3})-(\d{2})$/.exec(end || ""); return m && MONTHS.includes(m[1]) ? (2000 + +m[2]) * 12 + MONTHS.indexOf(m[1]) : null; };
+const pts = (a, b) => (a != null && b != null ? (a - b) * 100 : null);
+
+function ttm(byM, latestM) {
+  const win = [0, 1, 2, 3].map((i) => byM.get(latestM - 3 * i));
+  if (win.some((w) => !w)) {
+    const missing = [0, 1, 2, 3].filter((i) => !win[i]).map((i) => { const m = latestM - 3 * i; return `${MONTHS[m % 12]}-${String(Math.floor(m / 12)).slice(-2)}`; });
+    return { available: false, reason: `needs 4 consecutive quarters; missing quarter(s) ending ${missing.join(", ")} (ask for more quarters)` };
+  }
+  const t = {};
+  for (const k of ["revenue", "ebitda", "pbt", "pat", "net_profit", "eps", "other_income"]) {
+    const v = win.map((w) => w.metrics[k]);
+    t[k] = v.every((x) => x != null) ? rnd(v.reduce((a, b) => a + b, 0), 2) : null;
+  }
+  return { ...t, available: true, quarters: win.map((w) => w.period || w.quarter), ebitda_margin: rnd(ratio(t.ebitda, t.revenue)), pat_margin: rnd(ratio(t.pat, t.revenue)) };
+}
+
+function fundamentals(quarters) {
+  const rows = quarters.map((q) => ({ quarter: q.quarter, period: q.period, period_end: q.period_end, _m: monthIndex(q.period_end), metrics: quarterMetrics(q.lines || {}) }))
+    .filter((r) => r._m != null);
+  const byM = new Map(rows.map((r) => [r._m, r]));
+  for (const r of rows) {
+    for (const [label, back] of [["yoy", 12], ["qoq", 3]]) {
+      const prev = byM.get(r._m - back);
+      r[label] = prev ? { ...Object.fromEntries(GROWTH_KEYS.map((k) => [k, rnd(growth(r.metrics[k], prev.metrics[k]))])),
+        ebitda_margin_change_pts: rnd(pts(r.metrics.ebitda_margin, prev.metrics.ebitda_margin), 2) } : null;
+    }
+  }
+  const out = { quarters: rows.map(({ _m, ...r }) => r) };
+  out.ttm = rows.length ? ttm(byM, rows[0]._m) : { available: false, reason: "no quarters" };
+  if (out.ttm.available) {
+    const prior = ttm(byM, rows[0]._m - 12);
+    out.ttm.growth_vs_prior_ttm = prior.available ? Object.fromEntries(GROWTH_KEYS.map((k) => [k, rnd(growth(out.ttm[k], prior[k]))])) : null;
+  }
+  return out;
+}
+
+function unitFactor(latestRevenue, card, latestEnd) {
+  const known = [[0.1, "Rs million"], [0.01, "Rs lakh"], [1, "Rs crore"], [0.0001, "Rs thousand"]];
+  let cardCr = null;
+  if (card && typeof card === "object" && latestEnd) {
+    const m = /^\d+-(\w{3})-(\d{2})$/.exec(latestEnd);
+    const want = m ? `${m[1]}-${m[2]}` : null;
+    const col = ["col2", "col3"].find((c) => card[c] === want);
+    const row = (card.resultinCr || []).find((r) => String(r.title || "").toLowerCase().startsWith("revenue"));
+    if (col && row) cardCr = num({ col2: row.v1, col3: row.v2 }[col]);
+  }
+  if (cardCr && latestRevenue) {
+    const f = cardCr / latestRevenue;
+    for (const [k, name] of known) if (Math.abs(f / k - 1) < 0.02) return { crore_per_unit: k, unit: name, basis: "matched against BSE's Rs-crore results card" };
+    return { crore_per_unit: null, unit: null, basis: `filed figures don't match BSE's Rs-crore card by a known unit (ratio ${f.toPrecision(6)}); Rs-crore values skipped` };
+  }
+  return { crore_per_unit: 0.1, unit: "Rs million", basis: "assumed (BSE's label); couldn't cross-check against the Rs-crore card" };
+}
+
+function valuation(t, price, mcapCr, cpu) {
+  if (!t.available) return { available: false, reason: "needs TTM figures: " + (t.reason || "") };
+  const revCr = cpu && t.revenue != null ? t.revenue * cpu : null;
+  const eps = t.eps;
+  return { available: true, price, market_cap_cr: mcapCr, ttm_revenue_cr: rnd(revCr, 2), ttm_eps: eps,
+    pe_ttm: eps && eps > 0 ? rnd(ratio(price, eps), 2) : null, price_to_sales_ttm: rnd(ratio(mcapCr, revCr), 2),
+    not_computed: "EV/EBITDA, P/B, ROCE and debt ratios need the balance sheet, which BSE's results endpoints don't give" };
+}
+
+const TECHNICAL_DEFINITIONS = {
+  returns: "close-to-close change over the last N trading days (1w=5, 1m=21, 3m=63, 6m=126, 1y=252, 3y=756, 5y=1260)",
+  cagr: "compound annual growth from the first to the last close (calendar days when dates are given, else 252 trading days a year)",
+  volatility_annualised: "sample standard deviation of daily log returns over the last 252 days (or all, if fewer) x sqrt(252)",
+  max_drawdown: "largest peak-to-trough fall in the closes",
+  sma: "simple moving average of the last N closes",
+  ema: "exponential moving average, weight 2/(N+1), seeded with the SMA of the first N closes",
+  macd: "EMA12 - EMA26; signal = EMA9 of MACD; histogram = MACD - signal",
+  rsi_14: "Wilder's RSI: 100 - 100/(1 + average gain / average loss), Wilder-smoothed over 14 periods",
+  bollinger_20_2: "SMA20 +/- 2 population standard deviations of the last 20 closes; percent_b = (close - lower)/(upper - lower)",
+  range_52w: "high and low of the last 252 closes (closing prices only, so intraday extremes are not included)",
+  trend: "SMA50 against SMA200: 'golden cross' state when above, 'death cross' state when below",
+};
+const WINDOWS = { "1w": 5, "1m": 21, "3m": 63, "6m": 126, "1y": 252, "3y": 756, "5y": 1260 };
+const sma = (xs, n) => (xs.length >= n ? xs.slice(-n).reduce((a, b) => a + b, 0) / n : null);
+function emaSeries(xs, n) {
+  if (xs.length < n) return [];
+  const a = 2 / (n + 1), out = [xs.slice(0, n).reduce((p, c) => p + c, 0) / n];
+  for (const x of xs.slice(n)) out.push(a * x + (1 - a) * out[out.length - 1]);
+  return out;
+}
+function rsi(xs, n = 14) {
+  if (xs.length < n + 1) return null;
+  const ch = xs.slice(1).map((b, i) => b - xs[i]);
+  let gain = ch.slice(0, n).reduce((s, c) => s + Math.max(c, 0), 0) / n;
+  let loss = ch.slice(0, n).reduce((s, c) => s + Math.max(-c, 0), 0) / n;
+  for (const c of ch.slice(n)) { gain = (gain * (n - 1) + Math.max(c, 0)) / n; loss = (loss * (n - 1) + Math.max(-c, 0)) / n; }
+  if (loss === 0) return gain > 0 ? 100 : 50;
+  return 100 - 100 / (1 + gain / loss);
+}
+function maxDrawdown(xs, dates) {
+  let peak = 0, worst = 0, at = [0, 0];
+  xs.forEach((x, i) => { if (x > xs[peak]) peak = i; const dd = x / xs[peak] - 1; if (dd < worst) { worst = dd; at = [peak, i]; } });
+  const d = (i) => (dates ? dates[i] : i);
+  return worst < 0 ? { drawdown: rnd(worst), peak: d(at[0]), trough: d(at[1]) } : { drawdown: 0, peak: null, trough: null };
+}
+const stdev = (v, pop) => { const m = v.reduce((a, b) => a + b, 0) / v.length; return Math.sqrt(v.reduce((s, x) => s + (x - m) ** 2, 0) / (v.length - (pop ? 0 : 1))); };
+function parseDate(s) {
+  const t = String(s).trim();
+  let m = /^(\d{4})-(\d{2})-(\d{2})/.exec(t) || /^(\d{4})(\d{2})(\d{2})$/.exec(t);
+  if (m) return Date.UTC(+m[1], +m[2] - 1, +m[3]);
+  m = /^(\d{1,2})[- ](\w{3})[- ](\d{4})$/.exec(t);
+  if (m && MONTHS.includes(m[2].slice(0, 1).toUpperCase() + m[2].slice(1, 3).toLowerCase())) return Date.UTC(+m[3], MONTHS.indexOf(m[2].slice(0, 1).toUpperCase() + m[2].slice(1, 3).toLowerCase()), +m[1]);
+  m = /^(\d{2})-(\d{2})-(\d{4})$/.exec(t);
+  if (m) return Date.UTC(+m[3], +m[2] - 1, +m[1]);
+  throw new ToolFail(`unrecognised date ${JSON.stringify(s)}; use YYYY-MM-DD`);
+}
+
+function technicals(closes, dates) {
+  if (!Array.isArray(closes)) throw new ToolFail("closes must be a list of numbers");
+  const xs = closes.map(Number);
+  if (xs.length < 2) throw new ToolFail("need at least 2 closes");
+  if (xs.some((x) => !Number.isFinite(x) || x <= 0)) throw new ToolFail("closes must be positive numbers");
+  let parsed = null;
+  if (dates != null) {
+    if (dates.length !== xs.length) throw new ToolFail(`dates (${dates.length}) and closes (${xs.length}) differ in length`);
+    parsed = dates.map(parseDate);
+    if (parsed.some((d, i) => i && d <= parsed[i - 1])) throw new ToolFail("dates must be strictly increasing: pass the series oldest first");
+  }
+  const last = xs[xs.length - 1];
+  const returns = Object.fromEntries(Object.entries(WINDOWS).filter(([, n]) => xs.length > n).map(([k, n]) => [k, rnd(last / xs[xs.length - 1 - n] - 1)]));
+  const years = parsed ? (parsed[parsed.length - 1] - parsed[0]) / 864e5 / 365.25 : (xs.length - 1) / 252;
+  const cagr = years >= 1 ? rnd((last / xs[0]) ** (1 / years) - 1) : null;
+  const logr = xs.slice(1).map((b, i) => Math.log(b / xs[i])).slice(-252);
+  const vol = logr.length >= 2 ? rnd(stdev(logr) * Math.sqrt(252)) : null;
+  const e12 = emaSeries(xs, 12), e26 = emaSeries(xs, 26);
+  let macd = null;
+  if (e26.length) {
+    const line = e26.map((v, i) => e12[e12.length - e26.length + i] - v);
+    const sig = emaSeries(line, 9);
+    if (sig.length) macd = { macd: rnd(line[line.length - 1]), signal: rnd(sig[sig.length - 1]), histogram: rnd(line[line.length - 1] - sig[sig.length - 1]) };
+  }
+  let boll = null;
+  if (xs.length >= 20) {
+    const w = xs.slice(-20), mid = w.reduce((a, b) => a + b, 0) / 20, sd = stdev(w, true), up = mid + 2 * sd, lo = mid - 2 * sd;
+    boll = { middle: rnd(mid, 2), upper: rnd(up, 2), lower: rnd(lo, 2), percent_b: up > lo ? rnd((last - lo) / (up - lo)) : null, bandwidth: rnd((up - lo) / mid) };
+  }
+  const yr = xs.slice(-252), hi = Math.max(...yr), lo52 = Math.min(...yr);
+  const s50 = sma(xs, 50), s200 = sma(xs, 200);
+  const out = {
+    count: xs.length, from: dates ? dates[0] : null, to: dates ? dates[dates.length - 1] : null, last_close: last,
+    returns, cagr, volatility_annualised: vol, max_drawdown: maxDrawdown(xs, dates), max_drawdown_1y: maxDrawdown(xs.slice(-252), dates ? dates.slice(-252) : null),
+    sma: Object.fromEntries([20, 50, 200].map((n) => [`sma_${n}`, rnd(sma(xs, n), 2)])),
+    price_vs_sma: Object.fromEntries([20, 50, 200].map((n) => [`vs_sma_${n}`, sma(xs, n) ? rnd(last / sma(xs, n) - 1) : null])),
+    ema: { ema_12: e12.length ? rnd(e12[e12.length - 1], 2) : null, ema_26: e26.length ? rnd(e26[e26.length - 1], 2) : null },
+    macd, rsi_14: rnd(rsi(xs), 2), bollinger_20_2: boll,
+    range_52w: { high: hi, low: lo52, position: hi > lo52 ? rnd((last - lo52) / (hi - lo52)) : null, below_high: rnd(last / hi - 1), window_days: yr.length },
+    trend: s50 && s200 ? { sma50_vs_sma200: rnd(s50 / s200 - 1), state: s50 > s200 ? "golden cross (SMA50 above SMA200)" : "death cross (SMA50 below SMA200)" } : null,
+  };
+  const missing = [["sma_200 / trend", 200], ["1y range and volatility", 252], ["macd", 34], ["rsi_14", 15], ["bollinger", 20]].filter(([, need]) => xs.length < need).map(([n]) => n);
+  if (missing.length) out.needs_more_data = `${xs.length} closes given; for ${missing.join(", ")} pass more history (~260 trading days covers everything except 3y/5y returns)`;
+  return out;
+}
 
 const TOOLS = [
   {
@@ -244,31 +488,7 @@ const TOOLS = [
     async run({ scripcode, quarters = 5, upto }) {
       const sc = code(scripcode);
       const n = Math.max(1, Math.min(16, parseInt(quarters, 10) || 5));
-      let latest;
-      if (upto) latest = quarterIdFor(upto);
-      else {
-        const tab = await bseGet("TabResults_PAR_RESULTS", { scripcode: sc, tabtype: "RESULTS" });
-        const link = (tab && tab.resultinS && tab.resultinS[0] && tab.resultinS[0].LLQ) || "";
-        const m = /qtr=([\d.]+)/.exec(link);
-        const base = m ? Math.round(parseFloat(m[1])) : lastEndedQuarter();
-        const probes = [base + 1, base, base - 1, base - 2, base - 3];
-        const found = await Promise.all(probes.map((q) => detailedResult(sc, q)));
-        const i = found.findIndex(Boolean);
-        if (i < 0) throw new ToolFail(`BSE has no quarterly results for ${sc} around ${quarterLabel(base)}`);
-        latest = probes[i];
-      }
-      // Ask for n quarters plus a few spares at once; stop after 4 unfiled in a row.
-      const ids = Array.from({ length: n + 4 }, (_, i) => latest - i);
-      const res = await Promise.all(ids.map((q) => detailedResult(sc, q)));
-      const out = [];
-      let misses = 0;
-      for (const r of res) {
-        if (out.length >= n || misses >= 4) break;
-        if (!r) { misses++; continue; }
-        misses = 0;
-        out.push({ ...r, derived: derived(r.lines) });
-      }
-      return { scripcode: sc, quarters: out, note: "Amounts as filed with BSE (Rs million unless the company reports otherwise); expenses negative. derived.* are computed here: ebitda = sales + materials + stock-in-trade purchases + inventory change + employee + other expenses." };
+      return { scripcode: sc, quarters: await financials(sc, n, upto), note: FINANCIALS_NOTE };
     },
   },
   {
@@ -316,9 +536,40 @@ const TOOLS = [
       return bseGet(endpoint, filled);
     },
   },
+  {
+    name: "analyze_fundamentals",
+    description: "Computed fundamentals for a BSE scrip from its quarterly filings: revenue, EBITDA, PBT, PAT, EPS with YoY and QoQ growth (matched by period, not by position), margins and margin change, cost structure as % of revenue, interest coverage, tax rate, other income as % of PBT, TTM totals and TTM growth, and TTM P/E and price/sales from the live price. quarters: how many to fetch (8 gives TTM and its growth). Use this instead of doing the arithmetic yourself.",
+    inputSchema: { type: "object", properties: { scripcode: { type: "string" }, quarters: { type: "integer", default: 8 } }, required: ["scripcode"] },
+    async run({ scripcode, quarters = 8 }) {
+      const sc = code(scripcode);
+      const n = Math.max(1, Math.min(16, parseInt(quarters, 10) || 8));
+      const qs = await financials(sc, n);
+      if (!qs.length) throw new ToolFail(`BSE returned no quarterly results for ${sc}`);
+      const out = fundamentals(qs);
+      const [head, trade, card, com] = await Promise.all([
+        bseGet("getScripHeaderData", { Debtflag: "", scripcode: sc, seriesid: "" }), bseGet("StockTrading", { flag: "", quotetype: "EQ", scripcode: sc }),
+        bseGet("TabResults_PAR_RESULTS", { scripcode: sc, tabtype: "RESULTS" }), bseGet("ComHeadernew_par", { quotetype: "", scripcode: sc, seriesid: "" })]);
+      const h = head.Header || {}, cur = head.CurrRate || {};
+      const latest = out.quarters[0];
+      const unit = unitFactor(latest ? latest.metrics.revenue : null, card, latest ? latest.period_end : null);
+      out.valuation = valuation(out.ttm, num(h.LTP || cur.LTP), num(trade.MktCapFull), unit.crore_per_unit);
+      out.valuation.bse_reported = { pe: num(com.PE), eps: num(com.EPS), note: "BSE's own P/E and EPS; their EPS basis (e.g. annual, including discontinued items) can differ from TTM continuing EPS" };
+      return { scripcode: sc, unit, ...out, definitions: FUNDAMENTAL_DEFINITIONS,
+        note: "Figures are standalone as filed with BSE; amounts in the filed unit (see 'unit') unless the key ends in _cr. Further reading on these ratios: Zerodha Varsity, Fundamental Analysis https://zerodha.com/varsity/module/fundamental-analysis/" };
+    },
+  },
+  {
+    name: "analyze_prices",
+    description: "Technical indicators on a daily closing-price series, oldest first (e.g. from an NSE price-history tool): returns over 1w-5y, CAGR, annualised volatility, max drawdown, SMA 20/50/200, EMA 12/26, MACD(12,26,9), RSI(14), Bollinger(20,2), 52-week range position and the SMA50/200 trend. closes: numbers; dates: optional matching dates (YYYY-MM-DD). ~260 closes covers all but 3y/5y returns.",
+    inputSchema: { type: "object", properties: { closes: { type: "array", items: { type: "number" } }, dates: { type: "array", items: { type: "string" } } }, required: ["closes"] },
+    async run({ closes, dates }) {
+      return { ...technicals(closes, dates ?? null), definitions: TECHNICAL_DEFINITIONS,
+        note: "Computed on the closes given (oldest first). Indicators describe past prices; they are not forecasts or advice. Further reading: Zerodha Varsity, Technical Analysis https://zerodha.com/varsity/module/technical-analysis/" };
+    },
+  },
 ];
 
-const SERVER_INFO = { name: "bse", version: "0.1.0" };
+const SERVER_INFO = { name: "bse", version: "0.2.0" };
 const INSTRUCTIONS = "Live data from BSE India (Bombay Stock Exchange) by scrip code. Start with search_scrips when you only have a company name; the 5-6 digit code it returns is what every other tool takes. Amounts from get_financials are as BSE labels them (Rs million for most companies, as originally filed). Unofficial: not affiliated with BSE.";
 const PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
@@ -368,3 +619,6 @@ async function handle(m, origin) {
     default: return { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } };
   }
 }
+
+// Exported for tests (worker/test/worker.test.mjs); Cloudflare only uses the default export.
+export { rsi, maxDrawdown, emaSeries, technicals, fundamentals };
