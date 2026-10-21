@@ -122,6 +122,12 @@ async function bseGet(name, params) {
 }
 
 const num = (v) => { const n = parseFloat(String(v ?? "").replace(/,/g, "")); return Number.isFinite(n) ? n : null; };
+// BSE quotes some quantities as "3.51" with a separate "(Lakh)": return the plain number, or "value unit" for an unknown unit.
+const scaled = (v, unit) => {
+  const f = { "": 1, "(lakh)": 1e5, "(cr.)": 1e7, "(cr)": 1e7 }[String(unit ?? "").trim().toLowerCase()];
+  const n = num(v);
+  return n === null ? null : f ? Math.round(n * f) : `${v} ${unit}`.trim();
+};
 const code = (sc) => {
   const c = String(sc ?? "").trim();
   if (!/^\d{5,6}$/.test(c)) throw new ToolFail(`scripcode must be the 5-6 digit BSE code (got ${JSON.stringify(sc)}); use search_scrips to find it`);
@@ -146,6 +152,71 @@ function quarterIdFor(label) {
   const q = +m[1], fy = +m[2] > 100 ? +m[2] : 2000 + +m[2];
   const month = { 1: 5, 2: 8, 3: 11, 4: 2 }[q], year = q < 4 ? fy - 1 : fy;
   return 126 + Math.floor((year * 12 + month - (2025 * 12 + 5)) / 3);
+}
+
+// ======================================================================== session status (mirrors tools.session_status)
+// BSE answers a quote for any scrip at any time with the last price it has: after hours, on a holiday, and for a
+// suspended scrip years after its last trade. Only the quote's own 'Ason' stamp says how old the price is.
+const IST_MS = 330 * 60000;
+const OPEN_MIN = 9 * 60 + 15, CLOSE_MIN = 15 * 60 + 30;
+const REFERENCE_SCRIPS = ["500325", "500180"]; // Reliance, HDFC Bank: if neither traded today, the market didn't open
+let clock = () => new Date();
+const setClock = (fn) => { clock = fn; }; // for tests
+const two = (n) => String(n).padStart(2, "0");
+function istNow(d) { // the IST wall clock of a Date
+  const t = new Date(d.getTime() + IST_MS);
+  const date = t.toISOString().slice(0, 10), mins = t.getUTCHours() * 60 + t.getUTCMinutes();
+  return { date, mins, weekday: (t.getUTCDay() + 6) % 7, iso: `${date}T${two(t.getUTCHours())}:${two(t.getUTCMinutes())}+05:30` };
+}
+function parseAsOf(stamp) { // '21 Oct 26 | 13:23' -> { date: '2026-10-21', iso }, or null when it isn't that shape
+  const m = /^(\d{1,2}) (\w{3}) (\d{2}) \| (\d{1,2}):(\d{2})$/.exec(String(stamp ?? "").replace(/\s+/g, " ").trim());
+  if (!m || !MONTHS.includes(m[2]) || +m[4] > 23 || +m[5] > 59) return null;
+  const y = 2000 + +m[3], mo = MONTHS.indexOf(m[2]), d = +m[1];
+  if (new Date(Date.UTC(y, mo, d)).getUTCDate() !== d) return null;
+  const date = `${y}-${two(mo + 1)}-${two(d)}`;
+  return { date, iso: `${date}T${two(m[4])}:${m[5]}+05:30` };
+}
+function sessionStatus(stockAsOf, referenceAsOf, now = clock()) {
+  const n = istNow(now), stamp = parseAsOf(stockAsOf);
+  const out = { status: "unknown", data_as_of: stamp ? stamp.iso : stockAsOf ?? null, checked_at: n.iso };
+  if (!stamp) {
+    out.note = `couldn't read BSE's price timestamp (${stockAsOf == null ? "None" : `'${stockAsOf}'`}); treat the price as possibly stale`;
+  } else if (stamp.date === n.date) {
+    out.status = n.mins < OPEN_MIN ? "pre_open" : n.mins < CLOSE_MIN ? "live" : "closed_after_session";
+    out.note = { pre_open: "priced today but the continuous session hasn't started (opens 09:15 IST)",
+      live: "priced today, session in progress: today's candle is incomplete",
+      closed_after_session: "today's session has ended: this is today's close" }[out.status];
+  } else {
+    const refs = referenceAsOf.map(parseAsOf);
+    if (refs.some((r) => r && r.date === n.date)) {
+      out.status = "stock_not_trading";
+      out.note = `the market traded today but this scrip's last price is from ${stamp.date}: suspended, halted, or no trades today. Its numbers are not live`;
+    } else if (refs.length && refs.every((r) => r === null)) {
+      out.note = "this scrip's price is not from today and the reference scrips couldn't be read, so market state is unknown";
+    } else if (n.weekday < 5 && n.mins < OPEN_MIN) {
+      out.status = "awaiting_open";
+      out.note = `no trades yet today (before 09:15 IST, or a holiday); latest price is from ${stamp.date}`;
+    } else {
+      out.status = "market_closed";
+      out.note = `no scrip has traded today (weekend or holiday); latest price is from ${stamp.date}`;
+    }
+  }
+  return out;
+}
+async function headerStamp(sc) {
+  const head = await bseGet("getScripHeaderData", { Debtflag: "", scripcode: sc, seriesid: "" });
+  return head && head.Header ? head.Header.Ason ?? null : null;
+}
+async function sessionFor(sc, stockAsOf) { // fetches the reference scrips' stamps only when the scrip's own isn't from today
+  const now = clock(), stamp = parseAsOf(stockAsOf), refs = [];
+  if (stamp && stamp.date !== istNow(now).date) {
+    for (const ref of REFERENCE_SCRIPS.filter((r) => r !== sc)) {
+      try { refs.push(await headerStamp(ref)); } catch (err) { if (!(err instanceof ToolFail)) throw err; refs.push(null); }
+      const p = parseAsOf(refs[refs.length - 1]);
+      if (p && p.date === istNow(now).date) break; // one scrip that traded today is proof enough
+    }
+  }
+  return sessionStatus(stockAsOf, refs, now);
 }
 
 async function detailedResult(sc, id) {
@@ -258,39 +329,97 @@ function quarterMetrics(lines) {
     cost_structure: { materials: share(mat), employee: share(g("emp")), other_expenses: share(g("oth")), depreciation: share(g("dep")) },
   };
 }
+// Banks file a different format: interest earned/expended, operating profit before provisions, provisions and
+// asset quality. BSE stores sub-items and the NPA/capital ratios negative.
+const BL = { int_earned: "Interest Earned/Net Income from sales/services", int_expended: "Interest Expended", other_income: "Other Income",
+  emp: "Employee Cost", oth: "Other operating expenses", ppop: "Operating Profit Before Provisions and Contingencies",
+  prov: "Provisions (other than tax) and Contingencies", pbt: AL.pbt, tax: AL.tax, pat: AL.pat, net: AL.net,
+  eps: "Basic EPS before Extraordinary items", gnpa: "Amount of Gross NPA", nnpa: "Amount of Net NPA",
+  gnpa_pct: "% of Gross NPAs", nnpa_pct: "% of Net NPAs", roa: "Return on Assets", cet1: "CET 1 Ratio" };
+const BANK_DEFINITIONS = {
+  revenue: "interest earned, which is what BSE's results card calls a bank's revenue",
+  nii: "net interest income: interest earned - interest expended",
+  ppop: "operating profit before provisions and contingencies, as filed",
+  cost_to_income: "(employee cost + other operating expenses) / (NII + other income)",
+  credit_cost_share_of_ppop: "provisions (other than tax) / PPOP: how much of operating profit went to provisions",
+  non_interest_income_share: "other income / (NII + other income)",
+  "gross_npa_pct, net_npa_pct": "as filed, % of advances",
+  npa_coverage: "1 - net NPA / gross NPA (amounts): the share of bad loans already provided for",
+  roa_pct: "return on assets as filed (%, annualised by the bank)",
+  cet1_pct: "common equity tier 1 capital ratio as filed (%)",
+  eps: "basic EPS before extraordinary items (Rs per share)",
+  not_computed: "NIM, CASA, credit growth and P/B need balance-sheet data that BSE's results endpoints don't give",
+};
+const definitionsFor = (kind) => (kind !== "bank" ? FUNDAMENTAL_DEFINITIONS : {
+  ...Object.fromEntries(["tax_rate", "yoy", "ttm", "pe_ttm", "price_to_sales_ttm"].map((k) => [k, FUNDAMENTAL_DEFINITIONS[k]])), ...BANK_DEFINITIONS });
+const isBank = (lines) => lines[BL.int_earned] != null && lines[BL.int_expended] != null;
+
+function bankMetrics(lines) {
+  const g = (k) => (lines[BL[k]] ?? null);
+  const pos = (k) => (g(k) != null ? Math.abs(g(k)) : null); // BSE files these with a minus sign
+  const ie = g("int_earned"), iex = g("int_expended"), oi = g("other_income");
+  const nii = ie != null && iex != null ? ie + iex : null; // interest expended is negative
+  const opex = g("emp") != null && g("oth") != null ? -(g("emp") + g("oth")) : null;
+  const income = nii != null && oi != null ? nii + oi : null;
+  const ppop = g("ppop"), prov = pos("prov"), pbt = g("pbt"), tax = g("tax"), pat = g("pat"), gnpa = pos("gnpa"), nnpa = pos("nnpa");
+  return {
+    revenue: ie, nii: rnd(nii, 2), other_income: oi, operating_expenses: rnd(opex, 2), ppop, provisions: prov,
+    pbt, pat, net_profit: g("net"), eps: g("eps"),
+    cost_to_income: rnd(ratio(opex, income)), credit_cost_share_of_ppop: rnd(ratio(prov, ppop)),
+    non_interest_income_share: rnd(ratio(oi, income)), pat_margin: rnd(ratio(pat, ie)),
+    tax_rate: rnd(ratio(tax != null ? -tax : null, pbt)),
+    gross_npa_pct: pos("gnpa_pct"), net_npa_pct: pos("nnpa_pct"),
+    npa_coverage: gnpa && nnpa != null ? rnd(1 - nnpa / gnpa) : null,
+    roa_pct: g("roa"), cet1_pct: pos("cet1"),
+  };
+}
+// kind -> [growth keys, TTM sums, TTM ratios as [name, numerator, denominator], margin whose change is reported in points]
+const KINDS = {
+  company: [GROWTH_KEYS, ["revenue", "ebitda", "pbt", "pat", "net_profit", "eps", "other_income"],
+    [["ebitda_margin", "ebitda", "revenue"], ["pat_margin", "pat", "revenue"]], "ebitda_margin"],
+  bank: [["revenue", "nii", "ppop", "pat", "eps"], ["revenue", "nii", "other_income", "operating_expenses", "ppop", "provisions", "pbt", "pat", "net_profit", "eps"],
+    [["pat_margin", "pat", "revenue"], ["credit_cost_share_of_ppop", "provisions", "ppop"]], "cost_to_income"],
+};
 const monthIndex = (end) => { const m = /^\d+-(\w{3})-(\d{2})$/.exec(end || ""); return m && MONTHS.includes(m[1]) ? (2000 + +m[2]) * 12 + MONTHS.indexOf(m[1]) : null; };
 const pts = (a, b) => (a != null && b != null ? (a - b) * 100 : null);
 
-function ttm(byM, latestM) {
+function ttm(byM, latestM, kind = "company") {
   const win = [0, 1, 2, 3].map((i) => byM.get(latestM - 3 * i));
   if (win.some((w) => !w)) {
     const missing = [0, 1, 2, 3].filter((i) => !win[i]).map((i) => { const m = latestM - 3 * i; return `${MONTHS[m % 12]}-${String(Math.floor(m / 12)).slice(-2)}`; });
     return { available: false, reason: `needs 4 consecutive quarters; missing quarter(s) ending ${missing.join(", ")} (ask for more quarters)` };
   }
+  const [, sums, ratios] = KINDS[kind];
   const t = {};
-  for (const k of ["revenue", "ebitda", "pbt", "pat", "net_profit", "eps", "other_income"]) {
+  for (const k of sums) {
     const v = win.map((w) => w.metrics[k]);
     t[k] = v.every((x) => x != null) ? rnd(v.reduce((a, b) => a + b, 0), 2) : null;
   }
-  return { ...t, available: true, quarters: win.map((w) => w.period || w.quarter), ebitda_margin: rnd(ratio(t.ebitda, t.revenue)), pat_margin: rnd(ratio(t.pat, t.revenue)) };
+  Object.assign(t, { available: true, quarters: win.map((w) => w.period || w.quarter) });
+  for (const [name, a, b] of ratios) t[name] = rnd(ratio(t[a], t[b]));
+  return t;
 }
 
+// A bank's filings have no sales or EBITDA lines, so banks get bank metrics (NII, PPOP, NPAs, ...) instead.
 function fundamentals(quarters) {
-  const rows = quarters.map((q) => ({ quarter: q.quarter, period: q.period, period_end: q.period_end, _m: monthIndex(q.period_end), metrics: quarterMetrics(q.lines || {}) }))
+  const kind = quarters.length && isBank(quarters[0].lines || {}) ? "bank" : "company";
+  const [growthKeys, , , margin] = KINDS[kind];
+  const metrics = kind === "bank" ? bankMetrics : quarterMetrics;
+  const rows = quarters.map((q) => ({ quarter: q.quarter, period: q.period, period_end: q.period_end, _m: monthIndex(q.period_end), metrics: metrics(q.lines || {}) }))
     .filter((r) => r._m != null);
   const byM = new Map(rows.map((r) => [r._m, r]));
   for (const r of rows) {
     for (const [label, back] of [["yoy", 12], ["qoq", 3]]) {
       const prev = byM.get(r._m - back);
-      r[label] = prev ? { ...Object.fromEntries(GROWTH_KEYS.map((k) => [k, rnd(growth(r.metrics[k], prev.metrics[k]))])),
-        ebitda_margin_change_pts: rnd(pts(r.metrics.ebitda_margin, prev.metrics.ebitda_margin), 2) } : null;
+      r[label] = prev ? { ...Object.fromEntries(growthKeys.map((k) => [k, rnd(growth(r.metrics[k], prev.metrics[k]))])),
+        [`${margin}_change_pts`]: rnd(pts(r.metrics[margin], prev.metrics[margin]), 2) } : null;
     }
   }
-  const out = { quarters: rows.map(({ _m, ...r }) => r) };
-  out.ttm = rows.length ? ttm(byM, rows[0]._m) : { available: false, reason: "no quarters" };
+  const out = { kind, quarters: rows.map(({ _m, ...r }) => r) };
+  out.ttm = rows.length ? ttm(byM, rows[0]._m, kind) : { available: false, reason: "no quarters" };
   if (out.ttm.available) {
-    const prior = ttm(byM, rows[0]._m - 12);
-    out.ttm.growth_vs_prior_ttm = prior.available ? Object.fromEntries(GROWTH_KEYS.map((k) => [k, rnd(growth(out.ttm[k], prior[k]))])) : null;
+    const prior = ttm(byM, rows[0]._m - 12, kind);
+    out.ttm.growth_vs_prior_ttm = prior.available ? Object.fromEntries(growthKeys.map((k) => [k, rnd(growth(out.ttm[k], prior[k]))])) : null;
   }
   return out;
 }
@@ -699,9 +828,10 @@ const TOOLS = [
       const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, num(o[k])]));
       return {
         scripcode: sc, name: cmp.FullN, symbol: com.SecurityId, isin: com.ISIN, bse_url: cmp.SEOUrlEQ ? "https://www.bseindia.com" + cmp.SEOUrlEQ : null,
+        session: await sessionFor(sc, h.Ason),
         price: { ltp: num(h.LTP || cur.LTP), change: num(cur.Chg), change_pct: num(cur.PcChg), open: num(h.Open), high: num(h.High), low: num(h.Low), prev_close: num(h.PrevClose), as_of: h.Ason },
         range: { week52_high: hilo.Fifty2WkHigh_unadj, week52_low: hilo.Fifty2WkLow_unadj, week_high_low: hilo.WeekHighLow, month_high_low: hilo.MonthHighLow, price_band: [band.LowerT, band.UpperT], circuit_limit: trade.CktLimit },
-        trading: { wap: num(trade.WAP), turnover: trade.Turnover ? `${trade.Turnover} ${trade.Turnoverin || ""}`.trim() : null, traded_qty: num(trade.TTQ),
+        trading: { wap: num(trade.WAP), turnover: trade.Turnover ? `${trade.Turnover} ${trade.Turnoverin || ""}`.trim() : null, traded_qty: scaled(trade.TTQ, trade.TTQin),
           two_week_avg_qty: trade.TwoWkAvgQty ? `${trade.TwoWkAvgQty} ${trade.TwoWkAvgQtyin || ""}`.trim() : null, delivered_qty: num(pos.DeliverableQty), delivery_pct: num(pos.PcDQ_TQ),
           delivery_as_of: pos.TradeDate, market_cap_cr: num(trade.MktCapFull), free_float_mcap_cr: num(trade.MktCapFF), ex_date: trade.ExDate },
         ratios: { standalone: pick(com, ["EPS", "CEPS", "PE", "PB", "ROE", "OPM", "NPM"]),
@@ -709,6 +839,15 @@ const TOOLS = [
         classification: Object.fromEntries(["Group", "Index", "Sector", "IndustryNew", "Industry", "IGroup", "ISubGroup", "FaceVal", "SetlType"].map((k) => [k, com[k]])),
         flags,
       };
+    },
+  },
+  {
+    name: "get_session_status",
+    description: "Whether a BSE scrip's price is from today's session. BSE returns a last price for every scrip at all times (after hours, holidays, suspended scrips), so this compares the price's own timestamp with today in IST. status: live, closed_after_session, pre_open, awaiting_open, market_closed (nothing traded today), stock_not_trading (the market traded but this scrip didn't), or unknown. data_as_of is the price's timestamp. get_quote, analyze_fundamentals and analyze_prices(scripcode) include the same block.",
+    inputSchema: { type: "object", properties: { scripcode: { type: "string", description: "5-6 digit BSE code" } }, required: ["scripcode"] },
+    async run({ scripcode }) {
+      const sc = code(scripcode);
+      return { scripcode: sc, ...(await sessionFor(sc, await headerStamp(sc))) };
     },
   },
   {
@@ -798,7 +937,7 @@ const TOOLS = [
   },
   {
     name: "analyze_fundamentals",
-    description: "Computed fundamentals for a BSE scrip from its quarterly filings: revenue, EBITDA, PBT, PAT, EPS with YoY and QoQ growth (matched by period, not by position), margins and margin change, cost structure as % of revenue, interest coverage, tax rate, other income as % of PBT, TTM totals and TTM growth, and TTM P/E and price/sales from the live price. quarters: how many to fetch (8 gives TTM and its growth). Use this instead of doing the arithmetic yourself.",
+    description: "Computed fundamentals for a BSE scrip from its quarterly filings: revenue, EBITDA, PBT, PAT, EPS with YoY and QoQ growth (matched by period, not by position), margins and margin change, cost structure as % of revenue, interest coverage, tax rate, other income as % of PBT, TTM totals and TTM growth, and TTM P/E and price/sales from the live price. quarters: how many to fetch (8 gives TTM and its growth). Banks file a different format, so for them (kind='bank') you get NII, PPOP, cost-to-income, provisions, gross/net NPA %, NPA coverage, RoA and CET1 instead of EBITDA and cost structure. Use this instead of doing the arithmetic yourself.",
     inputSchema: { type: "object", properties: { scripcode: { type: "string" }, quarters: { type: "integer", default: 8 } }, required: ["scripcode"] },
     async run({ scripcode, quarters = 8 }) {
       const sc = code(scripcode);
@@ -814,7 +953,7 @@ const TOOLS = [
       const unit = unitFactor(latest ? latest.metrics.revenue : null, card, latest ? latest.period_end : null);
       out.valuation = valuation(out.ttm, num(h.LTP || cur.LTP), num(trade.MktCapFull), unit.crore_per_unit);
       out.valuation.bse_reported = { pe: num(com.PE), eps: num(com.EPS), note: "BSE's own P/E and EPS; their EPS basis (e.g. annual, including discontinued items) can differ from TTM continuing EPS" };
-      return { scripcode: sc, unit, ...out, definitions: FUNDAMENTAL_DEFINITIONS,
+      return { scripcode: sc, session: await sessionFor(sc, h.Ason), unit, ...out, definitions: definitionsFor(out.kind),
         note: "Figures are standalone as filed with BSE; amounts in the filed unit (see 'unit') unless the key ends in _cr. Further reading on these ratios: Zerodha Varsity, Fundamental Analysis https://zerodha.com/varsity/module/fundamental-analysis/" };
     },
   },
@@ -826,14 +965,15 @@ const TOOLS = [
       highs: { type: "array", items: { type: "number" } }, lows: { type: "array", items: { type: "number" } }, volumes: { type: "array", items: { type: "number" } },
       timeframe: { type: "string", enum: ["daily", "weekly"], default: "daily" }, entry_date: { type: "string" }, side: { type: "string", enum: ["long", "short"], default: "long" } } },
     async run({ closes, dates, highs, lows, volumes, timeframe = "daily", entry_date = null, side = "long", scripcode }) {
-      let source = "the series passed in, oldest first";
+      let source = "the series passed in, oldest first", session = null;
       if (scripcode) {
         if ([closes, dates, highs, lows, volumes].some((v) => v != null)) throw new ToolFail("pass either scripcode (BSE's daily closes for the last 12 months) or your own series, not both");
         const h = await priceHistory(code(scripcode));
         ({ closes, dates, volumes } = h);
+        try { session = await sessionFor(h.scripcode, await headerStamp(h.scripcode)); } catch (err) { if (!(err instanceof ToolFail)) throw err; session = sessionStatus(null, []); }
         source = `BSE's daily closes and volumes for ${h.scripcode}, ${h.from} to ${h.to}. BSE gives no daily highs and lows here, so ATR, ADX, stochastic, chandelier and pivots need daily candles from another source.`;
       } else if (closes == null) throw new ToolFail("pass closes (oldest first), or scripcode to use BSE's daily closes for the last 12 months");
-      return { ...technicals(closes, dates ?? null, highs ?? null, lows ?? null, volumes ?? null, timeframe, entry_date, side), source, definitions: TECHNICAL_DEFINITIONS,
+      return { ...technicals(closes, dates ?? null, highs ?? null, lows ?? null, volumes ?? null, timeframe, entry_date, side), source, ...(session ? { session } : {}), definitions: TECHNICAL_DEFINITIONS,
         note: "Indicators describe past prices; they are not forecasts or advice. Further reading: Zerodha Varsity, Technical Analysis https://zerodha.com/varsity/module/technical-analysis/" };
     },
   },
@@ -901,4 +1041,4 @@ async function handle(m, origin) {
 }
 
 // Exported for tests (worker/test/worker.test.mjs); Cloudflare only uses the default export.
-export { rsi, maxDrawdown, emaSeries, technicals, fundamentals, atr, adx, stochastic, swings, fibonacci, rsiDivergence, toWeekly, tradeCosts, positionSize };
+export { sessionStatus, parseAsOf, setClock, scaled, bankMetrics, rsi, maxDrawdown, emaSeries, technicals, fundamentals, atr, adx, stochastic, swings, fibonacci, rsiDivergence, toWeekly, tradeCosts, positionSize };

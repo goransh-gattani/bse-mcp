@@ -51,6 +51,13 @@ def test_get_quote(fake):
     assert q["range"]["price_band"] == ["6,098.65", "7,453.85"]
 
 
+def test_traded_qty_applies_bses_unit(fake, monkeypatch):
+    assert tools._scaled("4045", "") == 4045 and tools._scaled("3.51", "(Lakh)") == 351000
+    assert tools._scaled("1.2", "(Cr.)") == 12_000_000 and tools._scaled("5", "(Mn)") == "5 (Mn)" and tools._scaled("x", "") is None
+    monkeypatch.setitem(F.FIX, "StockTrading", {**F.FIX["StockTrading"], "TTQ": "3.51", "TTQin": "(Lakh)"})
+    assert tools.get_quote("500002")["trading"]["traded_qty"] == 351000
+
+
 def test_bad_scripcode_says_what_to_do(fake):
     with pytest.raises(ArgError, match="search_scrips"):
         tools.get_quote("abb")

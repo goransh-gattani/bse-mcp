@@ -11,12 +11,14 @@ Unofficial. Not affiliated with BSE. It reads the same public endpoints the bsei
 | `search_scrips(query)` | Scrip codes matching a name, symbol, ISIN or code fragment. Start here. |
 | `get_quote(scripcode)` | LTP and change, day / 52-week ranges, price band, volume, delivery %, market cap, EPS / PE / PB / ROE / margins (standalone and consolidated), group, sector, flags (ASM/GSM). |
 | `get_market_depth(scripcode)` | Top-5 bids and asks with totals. |
+| `get_session_status(scripcode)` | Whether the scrip's price is from today's session (`live`, `closed_after_session`, `pre_open`, `awaiting_open`, `market_closed`, `stock_not_trading`, `unknown`), judged from the price's own timestamp, since BSE quotes every scrip at all times. `get_quote`, `analyze_fundamentals` and `analyze_prices(scripcode)` carry the same `session` block. |
 | `get_peers(scripcode)` | BSE's peer table: price, PE, PB, revenue, PAT, margins, 52-week range. |
 | `get_price_history(scripcode)` | BSE's daily closes and traded quantity for the last 12 months, oldest first (no daily highs and lows). |
 | `get_financials(scripcode, quarters=5, upto=None)` | Quarterly P&L as filed, newest first, each quarter labelled by its months (`Apr–Jun 2026`) and by Indian FY (`Q1 FY27`); derived EBITDA, EBITDA / PBT / PAT margins and tax rate. The latest filed quarter is detected automatically. |
-| `analyze_fundamentals(scripcode, quarters=8)` | Computed from the filings: YoY and QoQ growth (matched by period), margins and margin change, cost structure, interest coverage, tax rate, other income as % of PBT, TTM totals and TTM growth, TTM P/E and price/sales. The filing unit is checked against BSE's Rs-crore results card instead of assumed. |
+| `analyze_fundamentals(scripcode, quarters=8)` | Computed from the filings: YoY and QoQ growth (matched by period), margins and margin change, cost structure, interest coverage, tax rate, other income as % of PBT, TTM totals and TTM growth, TTM P/E and price/sales. The filing unit is checked against BSE's Rs-crore results card instead of assumed. Banks (`kind: "bank"`) get NII, PPOP, cost-to-income, provisions, gross / net NPA %, NPA coverage, RoA and CET1 instead. |
 | `analyze_prices(scripcode=None, closes=None, dates, highs, lows, volumes, timeframe="daily", entry_date=None, side="long")` | Technical indicators, either on BSE's last 12 months of daily closes (`scripcode`) or on daily candles you pass in (e.g. from NSE's `nse-bhavcopy` MCP server): returns, CAGR, volatility, drawdown, SMA 20/50/200, EMA 12/26/50, MACD, RSI(14), Bollinger(20,2), 52-week position, SMA50/200 trend, swing highs and lows with RSI, Fibonacci levels and pullback targets, RSI divergence, volume vs its average, and `price_jumps` (possible unadjusted splits). With highs and lows also ATR(14), ADX/DI, stochastic, chandelier exit and pivots. `timeframe="weekly"` builds weekly bars; `entry_date` adds trailing-stop levels since the entry. |
 | `position_size(capital, entry, stop or atr, risk_pct=1, target, ...)` | Shares for a trade by fixed-fractional risk, capped by capital (with leverage) and a single-stock limit, saying which limit decided; loss at stop and gain at target net of STT, exchange and SEBI charges, stamp duty, GST and your brokerage; reward:risk, breakeven move, expected value and Kelly fractions. |
+| `record_analysis(scripcode, skill, action, entry, stop, target, horizon_days=20, ...)` | Saves a skill's verdict (buy / sell / hold / avoid) to the local journal with the live price and session status, for scoring later (Python server only; see [Judging the skills](#judging-the-skills)). |
 | `get_announcements(scripcode, months=12, category="all", page=1)` | Filings from BSE's announcements feed with PDF links; `category="results"` for financial results only. |
 | `download_announcement_pdf(attachment, save_dir, filename=None)` | Saves a filing's PDF (Python server only). |
 | `list_scrips(segment, status, group, name_contains, scripcode, limit)` | BSE's List of Securities, filtered. |
@@ -46,6 +48,17 @@ Getting them:
 - **Claude app** (claude.ai and the desktop app): download the zips from [`skill-zips/`](skill-zips/) and add each one under Customize → Skills → + → Create skill → Upload a skill. Skills need "Code execution and file creation" turned on in Settings → Capabilities. Skills you enable there also reach Claude Code when you're signed in to the same account, so you can then run `bse-mcp setup --no-skills`.
 
 ATR, ADX, stochastic and the ATR-based stops need daily highs and lows, which BSE's price chart doesn't give. Connect NSE's free end-of-day server for those: in Claude Code `claude mcp add --transport http nse-bhavcopy https://mcp.nseindia.in/bhavcopy/cm/mcp`; in the Claude app, Settings → Connectors → Add custom connector with the same URL. Without it the skills use BSE's closes and say which levels they couldn't compute.
+
+## Judging the skills
+
+The Python server keeps a journal in `~/.bse-mcp/journal.db` (SQLite; `BSE_MCP_JOURNAL` moves it) so you can see which skills' calls work out:
+
+- The skills end an analysis by calling `record_analysis` with their verdict, entry, stop, target and horizon. The live price, session status, skill version (a hash of the skill's files) and model are saved with it.
+- `bse-mcp snapshot [500112:SBIN ...]` records `get_quote` and `analyze_prices` for each scrip (or for the lines of `~/.bse-mcp/watchlist.txt`, `scripcode [NSE symbol]` each) and keeps NSE daily candles locally, because BSE and NSE only serve recent history. Run it a few times a day, e.g. with cron: `30 9,13 * * 1-5 bse-mcp snapshot` and `0 16 * * 1-5 bse-mcp snapshot` (cron needs the full path that `which bse-mcp` prints).
+- `bse-mcp score` scores each verdict once `horizon_days` trading days have closed after the day it was made, on NSE candles: return from the entry, return in the call's direction, best and worst move, and whether the stop or the target was hit first (`ambiguous` when one daily bar spans both). Days after the verdict only; nothing before it is used.
+- `bse-mcp report` summarises per skill and skill version: calls, scored, average return in the call's direction, hit rate, and target / stop / ambiguous counts.
+
+A few weeks of calls on a handful of stocks says little: let it run over many scrips for a few months before comparing skills.
 
 ## Install
 

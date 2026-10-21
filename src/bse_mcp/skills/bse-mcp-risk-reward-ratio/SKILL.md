@@ -11,6 +11,10 @@ If the math doesn't work, don't take the trade. R:R is the simplest filter that 
 
 This is arithmetic on entry, stop and target: use `position_size` (bse-mcp) rather than computing by hand. With `target` it returns R:R before and after Indian trading costs (STT, exchange charges, stamp duty, GST, and your brokerage if given); with `win_rate` it adds expected value, the breakeven win rate and Kelly fractions. Costs matter: a delivery round trip carries 0.2% STT alone, which visibly lowers R:R on tight setups. These tools are read-only and never place orders.
 
+Say how fresh the price is. BSE quotes every scrip at all times, including after hours, on holidays and for suspended scrips, so `get_quote`, `analyze_prices` with `scripcode` and `analyze_fundamentals` return a `session` block (`get_session_status` gives it alone). Name the time the numbers are from (`data_as_of`). `live`: today's candle is still forming and the indicators run to the previous close. `closed_after_session`: today's close. `pre_open`, `awaiting_open` or `market_closed`: the price is the last close, not live; say so. `stock_not_trading`: the market traded today but this scrip didn't (suspended, halted or no trades); don't present its price as tradable. `unknown`: treat the price as possibly stale.
+
+When you give a verdict on a stock (buy, sell, hold or avoid), record it with `record_analysis`: `skill` is this skill's name (`bse-mcp-risk-reward-ratio`), with the entry, stop and target you proposed and the number of trading days the call is for (`horizon_days`). The journal is how these skills get judged against what the price did next, so record the call as you stated it, once.
+
 ## Calculation
 
 ```

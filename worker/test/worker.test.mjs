@@ -1,5 +1,5 @@
 // Run with:  node --test worker/test/worker.test.mjs   (from the repo root). BSE answers come from fixtures.json.
-import w, { rsi, maxDrawdown, atr, adx, stochastic, swings, fibonacci, rsiDivergence, toWeekly, tradeCosts } from "../worker.js";
+import w, { rsi, maxDrawdown, atr, adx, stochastic, swings, fibonacci, rsiDivergence, toWeekly, tradeCosts, setClock, sessionStatus, parseAsOf, scaled } from "../worker.js";
 import fs from "node:fs";
 const F = JSON.parse(fs.readFileSync(new URL("./fixtures.json", import.meta.url), "utf8"));
 const calls = []; let fail = new Set();
@@ -31,7 +31,7 @@ check(r.status === 200 && j.result.protocolVersion === "2025-03-26" && j.result.
 r = await rpc({ jsonrpc: "2.0", method: "notifications/initialized" });
 check(r.status === 202, "notification -> 202");
 r = await rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" }); j = await r.json();
-check(j.result.tools.length === 12 && j.result.tools.every((t) => t.name && t.description && t.inputSchema.type === "object"), `tools/list (${j.result.tools.map((t) => t.name).join(",")})`);
+check(j.result.tools.length === 13 && j.result.tools.every((t) => t.name && t.description && t.inputSchema.type === "object"), `tools/list (${j.result.tools.map((t) => t.name).join(",")})`);
 r = await rpc({ jsonrpc: "2.0", id: 3, method: "nope" }); j = await r.json(); check(j.error && j.error.code === -32601, "unknown method -> -32601");
 r = await w.fetch(new Request(W + "/mcp", { method: "POST", body: "{bad" }), env); check((await r.json()).error.code === -32700, "parse error");
 r = await w.fetch(new Request(W + "/mcp"), env); check(r.status === 405, "GET /mcp -> 405");
@@ -155,6 +155,22 @@ const sd = Array.from({ length: 30 }, (_, i) => `2026-03-${String(i + 1).padStar
 let se = text(await call("analyze_prices", { closes: scl, dates: sd, highs: scl.map((x) => x + 1), lows: scl.map((x) => x - 1), entry_date: "2026-03-11" })).since_entry;
 const a14 = atr(scl.map((x) => x + 1), scl.map((x) => x - 1), scl, 14);
 check(se.first_bar === "2026-03-11" && se.bars === 20 && se.highest_close === 129 && se.atr_trail["1.5x"] === Math.round((129 - 1.5 * a14) * 100) / 100 && se.chandelier_since_entry === Math.round((130 - 3 * a14) * 100) / 100, `since entry (${JSON.stringify(se)})`);
+// session status: the clock pinned to Mon 19 Oct 2026 12:00 IST; the fixtures stamp every quote 12 Oct
+setClock(() => new Date("2026-10-19T12:00:00+05:30"));
+const at = (iso) => new Date(iso + "+05:30");
+check(parseAsOf("21 Oct 26 | 13:23").iso === "2026-10-21T13:23+05:30" && parseAsOf("19 Oct 2026") === null && parseAsOf(null) === null, "parse BSE stamps");
+check(sessionStatus("19 Oct 26 | 09:07", [], at("2026-10-19T09:05:00")).status === "pre_open" && sessionStatus("19 Oct 26 | 09:07", [], at("2026-10-19T15:29:00")).status === "live"
+  && sessionStatus("19 Oct 26 | 09:07", [], at("2026-10-19T15:30:00")).status === "closed_after_session", "phase by the clock");
+check(sessionStatus("22 Jun 23 | 16:00", ["19 Oct 26 | 11:59"], at("2026-10-19T12:00:00")).status === "stock_not_trading"
+  && sessionStatus("16 Oct 26 | 16:00", ["16 Oct 26 | 16:00"], at("2026-10-17T08:00:00")).status === "market_closed"
+  && sessionStatus("16 Oct 26 | 16:00", ["16 Oct 26 | 16:00"], at("2026-10-19T08:00:00")).status === "awaiting_open"
+  && sessionStatus("16 Oct 26 | 16:00", [null, null], at("2026-10-19T12:00:00")).status === "unknown", "stale stock: not trading, closed, awaiting open, unknown");
+check(text(await call("get_quote", { scripcode: "500002" })).session.status === "market_closed", "get_quote carries the session");
+check(text(await call("get_session_status", { scripcode: "500002" })).status === "market_closed", "get_session_status");
+check(text(await call("analyze_prices", { scripcode: "500002" })).session.status === "market_closed", "analyze_prices(scripcode) carries the session");
+check(text(await call("analyze_fundamentals", { scripcode: "500002" })).kind === "company", "fundamentals kind");
+check(scaled("3.51", "(Lakh)") === 351000 && scaled("4045", "") === 4045 && scaled("5", "(Mn)") === "5 (Mn)", "traded_qty units");
+setClock(() => new Date());
 // token
 r = await rpc({ jsonrpc: "2.0", id: 9, method: "ping" }, { env: { MCP_TOKEN: "s3cret" } }); check(r.status === 401, "MCP_TOKEN set: no token -> 401");
 r = await rpc({ jsonrpc: "2.0", id: 9, method: "ping" }, { env: { MCP_TOKEN: "s3cret" }, headers: { Authorization: "Bearer s3cret" } }); check(r.status === 200, "MCP_TOKEN set: right token -> 200");

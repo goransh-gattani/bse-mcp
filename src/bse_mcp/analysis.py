@@ -74,35 +74,104 @@ def quarter_metrics(lines: dict) -> dict:
     }
 
 
+# Banks file a different format (Schedule III for banks): interest earned/expended, operating profit before
+# provisions, provisions, and asset-quality lines. BSE stores sub-items and the NPA/capital ratios negative.
+B = {"int_earned": "Interest Earned/Net Income from sales/services", "int_expended": "Interest Expended", "other_income": "Other Income",
+     "emp": "Employee Cost", "oth": "Other operating expenses", "ppop": "Operating Profit Before Provisions and Contingencies",
+     "prov": "Provisions (other than tax) and Contingencies", "pbt": L["pbt"], "tax": L["tax"], "pat": L["pat"], "net": L["net"],
+     "eps": "Basic EPS before Extraordinary items", "gnpa": "Amount of Gross NPA", "nnpa": "Amount of Net NPA",
+     "gnpa_pct": "% of Gross NPAs", "nnpa_pct": "% of Net NPAs", "roa": "Return on Assets", "cet1": "CET 1 Ratio"}
+
+BANK_DEFINITIONS = {
+    "revenue": "interest earned, which is what BSE's results card calls a bank's revenue",
+    "nii": "net interest income: interest earned - interest expended",
+    "ppop": "operating profit before provisions and contingencies, as filed",
+    "cost_to_income": "(employee cost + other operating expenses) / (NII + other income)",
+    "credit_cost_share_of_ppop": "provisions (other than tax) / PPOP: how much of operating profit went to provisions",
+    "non_interest_income_share": "other income / (NII + other income)",
+    "gross_npa_pct, net_npa_pct": "as filed, % of advances",
+    "npa_coverage": "1 - net NPA / gross NPA (amounts): the share of bad loans already provided for",
+    "roa_pct": "return on assets as filed (%, annualised by the bank)",
+    "cet1_pct": "common equity tier 1 capital ratio as filed (%)",
+    "eps": "basic EPS before extraordinary items (Rs per share)",
+    "not_computed": "NIM, CASA, credit growth and P/B need balance-sheet data that BSE's results endpoints don't give",
+}
+
+
+def definitions_for(kind: str) -> dict:
+    if kind != "bank":
+        return FUNDAMENTAL_DEFINITIONS
+    shared = ("tax_rate", "yoy", "ttm", "pe_ttm", "price_to_sales_ttm")
+    return {**{k: FUNDAMENTAL_DEFINITIONS[k] for k in shared}, **BANK_DEFINITIONS}
+
+
+def is_bank(lines: dict) -> bool:
+    return lines.get(B["int_earned"]) is not None and lines.get(B["int_expended"]) is not None
+
+
+def bank_metrics(lines: dict) -> dict:
+    g = lambda k: lines.get(B[k])  # noqa: E731
+    pos = lambda k: abs(g(k)) if g(k) is not None else None  # noqa: E731  (BSE files these ratios with a minus sign)
+    ie, iex, oi = g("int_earned"), g("int_expended"), g("other_income")
+    nii = ie + iex if ie is not None and iex is not None else None  # interest expended is negative
+    opex = -(g("emp") + g("oth")) if g("emp") is not None and g("oth") is not None else None
+    income = nii + oi if nii is not None and oi is not None else None
+    ppop, prov, pbt, tax, pat = g("ppop"), pos("prov"), g("pbt"), g("tax"), g("pat")
+    gnpa, nnpa = pos("gnpa"), pos("nnpa")
+    return {
+        "revenue": ie, "nii": _r(nii, 2), "other_income": oi, "operating_expenses": _r(opex, 2), "ppop": ppop, "provisions": prov,
+        "pbt": pbt, "pat": pat, "net_profit": g("net"), "eps": g("eps"),
+        "cost_to_income": _r(_ratio(opex, income)), "credit_cost_share_of_ppop": _r(_ratio(prov, ppop)),
+        "non_interest_income_share": _r(_ratio(oi, income)), "pat_margin": _r(_ratio(pat, ie)),
+        "tax_rate": _r(_ratio(-tax if tax is not None else None, pbt)),
+        "gross_npa_pct": pos("gnpa_pct"), "net_npa_pct": pos("nnpa_pct"),
+        "npa_coverage": _r(1 - nnpa / gnpa) if gnpa and nnpa is not None else None,
+        "roa_pct": g("roa"), "cet1_pct": pos("cet1"),
+    }
+
+
 def _month_index(period_end: str) -> int | None:
     m = re.fullmatch(r"\d+-(\w{3})-(\d{2})", period_end or "")
     return (2000 + int(m.group(2))) * 12 + MONTHS.index(m.group(1)) if m and m.group(1) in MONTHS else None
 
 
 GROWTH_KEYS = ("revenue", "ebitda", "pbt", "pat", "eps")
+# kind -> (growth keys, TTM sums, TTM ratios as (name, numerator, denominator), margin whose change is reported in points)
+KINDS = {
+    "company": (GROWTH_KEYS, ("revenue", "ebitda", "pbt", "pat", "net_profit", "eps", "other_income"),
+                (("ebitda_margin", "ebitda", "revenue"), ("pat_margin", "pat", "revenue")), "ebitda_margin"),
+    "bank": (("revenue", "nii", "ppop", "pat", "eps"), ("revenue", "nii", "other_income", "operating_expenses", "ppop", "provisions", "pbt",
+                                                       "pat", "net_profit", "eps"),
+             (("pat_margin", "pat", "revenue"), ("credit_cost_share_of_ppop", "provisions", "ppop")), "cost_to_income"),
+}
 
 
 def fundamentals(quarters: list[dict]) -> dict:
-    """quarters: get_financials()['quarters'] (newest first). Adds metrics, YoY/QoQ growth and TTM."""
+    """quarters: get_financials()['quarters'] (newest first). Adds metrics, YoY/QoQ growth and TTM.
+
+    A bank's filings have no sales or EBITDA lines, so banks get bank metrics (NII, PPOP, NPAs, ...) instead."""
+    kind = "bank" if quarters and is_bank(quarters[0].get("lines") or {}) else "company"
+    growth_keys, _, _, margin = KINDS[kind]
+    metrics = bank_metrics if kind == "bank" else quarter_metrics
     rows = []
     for q in quarters:
         mi = _month_index(q.get("period_end"))
         if mi is None:
             continue
         rows.append({"quarter": q.get("quarter"), "period": q.get("period"), "period_end": q["period_end"], "_m": mi,
-                     "metrics": quarter_metrics(q.get("lines") or {})})
+                     "metrics": metrics(q.get("lines") or {})})
     by_m = {r["_m"]: r for r in rows}
     for r in rows:
         for label, back in (("yoy", 12), ("qoq", 3)):
             prev = by_m.get(r["_m"] - back)
-            r[label] = {k: _r(_growth(r["metrics"][k], prev["metrics"][k])) for k in GROWTH_KEYS} if prev else None
+            r[label] = {k: _r(_growth(r["metrics"][k], prev["metrics"][k])) for k in growth_keys} if prev else None
             if prev:
-                r[label]["ebitda_margin_change_pts"] = _r(_pts(r["metrics"]["ebitda_margin"], prev["metrics"]["ebitda_margin"]), 2)
-    out = {"quarters": [{k: v for k, v in r.items() if k != "_m"} for r in rows]}
-    out["ttm"] = _ttm(by_m, rows[0]["_m"]) if rows else {"available": False, "reason": "no quarters"}
+                r[label][f"{margin}_change_pts"] = _r(_pts(r["metrics"][margin], prev["metrics"][margin]), 2)
+    out = {"kind": kind, "quarters": [{k: v for k, v in r.items() if k != "_m"} for r in rows]}
+    out["ttm"] = _ttm(by_m, rows[0]["_m"], kind) if rows else {"available": False, "reason": "no quarters"}
     if out["ttm"].get("available"):
-        prior = _ttm(by_m, rows[0]["_m"] - 12)
-        out["ttm"]["growth_vs_prior_ttm"] = ({k: _r(_growth(out["ttm"][k], prior[k])) for k in GROWTH_KEYS} if prior.get("available")
+        prior = _ttm(by_m, rows[0]["_m"] - 12, kind)
+        out["ttm"]["growth_vs_prior_ttm"] = ({k: _r(_growth(out["ttm"][k], prior[k])) for k in growth_keys} if prior.get("available")
                                              else None)
     return out
 
@@ -111,17 +180,18 @@ def _pts(a, b):
     return (a - b) * 100 if a is not None and b is not None else None
 
 
-def _ttm(by_m: dict, latest_m: int) -> dict:
+def _ttm(by_m: dict, latest_m: int, kind: str = "company") -> dict:
     window = [by_m.get(latest_m - 3 * i) for i in range(4)]
     if any(w is None for w in window):
         missing = [MONTHS[(latest_m - 3 * i) % 12] + "-" + str((latest_m - 3 * i) // 12)[-2:] for i, w in enumerate(window) if w is None]
         return {"available": False, "reason": f"needs 4 consecutive quarters; missing quarter(s) ending {', '.join(missing)} (ask for more quarters)"}
+    _, sums, ratios, _ = KINDS[kind]
     t = {}
-    for k in ("revenue", "ebitda", "pbt", "pat", "net_profit", "eps", "other_income"):
+    for k in sums:
         vals = [w["metrics"][k] for w in window]
         t[k] = _r(sum(vals), 2) if all(v is not None for v in vals) else None
-    t.update({"available": True, "quarters": [w["period"] or w["quarter"] for w in window],
-              "ebitda_margin": _r(_ratio(t["ebitda"], t["revenue"])), "pat_margin": _r(_ratio(t["pat"], t["revenue"]))})
+    t.update({"available": True, "quarters": [w["period"] or w["quarter"] for w in window]})
+    t.update({name: _r(_ratio(t[a], t[b])) for name, a, b in ratios})
     return t
 
 

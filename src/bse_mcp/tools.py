@@ -9,7 +9,7 @@ from __future__ import annotations
 import html
 import re
 import urllib.parse
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 from . import bse
@@ -29,6 +29,15 @@ def _num(value):
         return float(str(value).replace(",", ""))
     except (TypeError, ValueError):
         return None
+
+
+def _scaled(value, unit):
+    """BSE quotes some quantities as '3.51' with a separate '(Lakh)'; return the plain number, or 'value unit' for a unit we don't know."""
+    factor = {"": 1, "(lakh)": 1e5, "(cr.)": 1e7, "(cr)": 1e7}.get(str(unit or "").strip().lower())
+    n = _num(value)
+    if n is None:
+        return None
+    return round(n * factor) if factor else f"{value} {unit}".strip()
 
 
 def _code(scripcode) -> str:
@@ -138,6 +147,81 @@ def detailed_result(code: str, qid: int) -> dict | None:
             "bse_quarter_id": f"{qid:.2f}", "period_begin": begin, "period_end": end, "type": meta.get("Type"), "lines": lines}
 
 
+# ---------------------------------------------------------------- session status
+# BSE answers a quote for any scrip at any time, with the last price it has: after hours, on a holiday,
+# and for a suspended scrip years after its last trade. The only thing that says how old the price is
+# is the quote's own 'Ason' stamp, so "is this live?" means "is that stamp today?".
+IST = timezone(timedelta(hours=5, minutes=30))
+OPEN_AT, CLOSE_AT = time(9, 15), time(15, 30)
+REFERENCE_SCRIPS = ("500325", "500180")  # Reliance, HDFC Bank: if neither traded today, the market didn't open
+
+
+def _now() -> datetime:  # separate so tests can pin the clock
+    return datetime.now(IST)
+
+
+def parse_as_of(stamp: str | None) -> datetime | None:
+    """'21 Oct 26 | 13:23' -> that moment in IST; None when BSE's stamp isn't that shape."""
+    try:
+        return datetime.strptime(re.sub(r"\s+", " ", str(stamp)).strip(), "%d %b %y | %H:%M").replace(tzinfo=IST)
+    except ValueError:
+        return None
+
+
+def session_status(stock_as_of: str | None, reference_as_of: list[str | None], now: datetime | None = None) -> dict:
+    """Whether a scrip's price is from today's session, and if not, why.
+
+    reference_as_of: the stamps of the reference scrips, only looked at when the stock's own is not from today
+    (pass [] when there was no need to fetch them)."""
+    now = (now or _now()).astimezone(IST)
+    stamp = parse_as_of(stock_as_of)
+    out = {"status": "unknown", "data_as_of": stamp.isoformat(timespec="minutes") if stamp else stock_as_of,
+           "checked_at": now.isoformat(timespec="minutes")}
+    if stamp is None:
+        out["note"] = f"couldn't read BSE's price timestamp ({stock_as_of!r}); treat the price as possibly stale"
+    elif stamp.date() == now.date():
+        out["status"] = "pre_open" if now.time() < OPEN_AT else "live" if now.time() < CLOSE_AT else "closed_after_session"
+        out["note"] = {"pre_open": "priced today but the continuous session hasn't started (opens 09:15 IST)",
+                       "live": "priced today, session in progress: today's candle is incomplete",
+                       "closed_after_session": "today's session has ended: this is today's close"}[out["status"]]
+    else:
+        refs = [parse_as_of(r) for r in reference_as_of]
+        if any(r and r.date() == now.date() for r in refs):
+            out["status"] = "stock_not_trading"
+            out["note"] = (f"the market traded today but this scrip's last price is from {stamp.date().isoformat()}: suspended, "
+                           "halted, or no trades today. Its numbers are not live")
+        elif refs and all(r is None for r in refs):
+            out["note"] = "this scrip's price is not from today and the reference scrips couldn't be read, so market state is unknown"
+        elif now.weekday() < 5 and now.time() < OPEN_AT:
+            out["status"] = "awaiting_open"
+            out["note"] = f"no trades yet today (before 09:15 IST, or a holiday); latest price is from {stamp.date().isoformat()}"
+        else:
+            out["status"] = "market_closed"
+            out["note"] = f"no scrip has traded today (weekend or holiday); latest price is from {stamp.date().isoformat()}"
+    return out
+
+
+def _stamp(code: str) -> str | None:
+    head = bse.get("getScripHeaderData", {"Debtflag": "", "scripcode": code, "seriesid": ""})
+    return (head.get("Header") or {}).get("Ason") if isinstance(head, dict) else None
+
+
+def _session_for(code: str, stock_as_of: str | None) -> dict:
+    """session_status for a scrip, fetching the reference scrips' stamps only when its own isn't from today."""
+    now = _now()
+    stamp = parse_as_of(stock_as_of)
+    refs: list[str | None] = []
+    if stamp is not None and stamp.date() != now.date():
+        for ref in (r for r in REFERENCE_SCRIPS if r != code):
+            try:
+                refs.append(_stamp(ref))
+            except BseError:
+                refs.append(None)
+            if (p := parse_as_of(refs[-1])) and p.date() == now.date():
+                break  # one scrip that traded today is proof enough
+    return session_status(stock_as_of, refs, now)
+
+
 def plain(text: str) -> str:
     """BSE headlines carry <BR> and entities; keep the line breaks, drop the rest."""
     text = re.sub(r"<\s*br\s*/?>", "\n", text or "", flags=re.I)
@@ -176,6 +260,7 @@ def get_quote(scripcode: str) -> dict:
     return {
         "scripcode": code, "name": cmp_.get("FullN"), "symbol": com.get("SecurityId"), "isin": com.get("ISIN"),
         "bse_url": bse.SITE + cmp_["SEOUrlEQ"] if cmp_.get("SEOUrlEQ") else None,
+        "session": _session_for(code, h.get("Ason")),
         "price": {"ltp": _num(h.get("LTP") or cur.get("LTP")), "change": _num(cur.get("Chg")), "change_pct": _num(cur.get("PcChg")),
                   "open": _num(h.get("Open")), "high": _num(h.get("High")), "low": _num(h.get("Low")), "prev_close": _num(h.get("PrevClose")),
                   "as_of": h.get("Ason")},
@@ -183,7 +268,7 @@ def get_quote(scripcode: str) -> dict:
                   "week_high_low": hilo.get("WeekHighLow"), "month_high_low": hilo.get("MonthHighLow"),
                   "price_band": [band.get("LowerT"), band.get("UpperT")], "circuit_limit": trade.get("CktLimit")},
         "trading": {"wap": _num(trade.get("WAP")), "turnover": unit(trade.get("Turnover"), trade.get("Turnoverin")),
-                    "traded_qty": _num(trade.get("TTQ")), "two_week_avg_qty": unit(trade.get("TwoWkAvgQty"), trade.get("TwoWkAvgQtyin")),
+                    "traded_qty": _scaled(trade.get("TTQ"), trade.get("TTQin")), "two_week_avg_qty": unit(trade.get("TwoWkAvgQty"), trade.get("TwoWkAvgQtyin")),
                     "delivered_qty": _num(pos.get("DeliverableQty")), "delivery_pct": _num(pos.get("PcDQ_TQ")), "delivery_as_of": pos.get("TradeDate"),
                     "market_cap_cr": _num(trade.get("MktCapFull")), "free_float_mcap_cr": _num(trade.get("MktCapFF")), "ex_date": trade.get("ExDate")},
         "ratios": {"standalone": {k: _num(com.get(k)) for k in ("EPS", "CEPS", "PE", "PB", "ROE", "OPM", "NPM")},
@@ -191,6 +276,11 @@ def get_quote(scripcode: str) -> dict:
         "classification": {k: com.get(k) for k in ("Group", "Index", "Sector", "IndustryNew", "Industry", "IGroup", "ISubGroup", "FaceVal", "SetlType")},
         "flags": {k: h[k] for k in ("ASMText", "GSMText", "EMSText", "SMSText", "IRPText", "DisplayText") if h.get(k)},
     }
+
+
+def get_session_status(scripcode: str) -> dict:
+    code = _code(scripcode)
+    return {"scripcode": code, **_session_for(code, _stamp(code))}
 
 
 def get_market_depth(scripcode: str) -> dict:
@@ -335,7 +425,7 @@ def analyze_fundamentals(scripcode: str, quarters: int = 8) -> dict:
     com = bse.get("ComHeadernew_par", {"quotetype": "", "scripcode": code, "seriesid": ""})
     out["valuation"]["bse_reported"] = {"pe": _num(com.get("PE")), "eps": _num(com.get("EPS")),
                                         "note": "BSE's own P/E and EPS; their EPS basis (e.g. annual, including discontinued items) can differ from TTM continuing EPS"}
-    return {"scripcode": code, "unit": unit, **out, "definitions": analysis.FUNDAMENTAL_DEFINITIONS,
+    return {"scripcode": code, "session": _session_for(code, h.get("Ason")), "unit": unit, **out, "definitions": analysis.definitions_for(out["kind"]),
             "note": "Figures are standalone as filed with BSE; amounts in the filed unit (see 'unit') unless the key ends in _cr. "
                     "Further reading on these ratios: Zerodha Varsity, Fundamental Analysis https://zerodha.com/varsity/module/fundamental-analysis/"}
 
@@ -375,6 +465,10 @@ def analyze_prices(closes: list[float] | None = None, dates: list[str] | None = 
         if any(v is not None for v in (closes, dates, highs, lows, volumes)):
             raise ArgError("pass either scripcode (BSE's daily closes for the last 12 months) or your own series, not both")
         hist = get_price_history(scripcode)
+        try:
+            session = _session_for(hist["scripcode"], _stamp(hist["scripcode"]))
+        except BseError:
+            session = session_status(None, [])
         closes, dates, volumes = hist["closes"], hist["dates"], hist["volumes"]
         source = (f"BSE's daily closes and volumes for {hist['scripcode']}, {hist['from']} to {hist['to']}. BSE gives no daily highs "
                   "and lows here, so ATR, ADX, stochastic, chandelier and pivots need daily candles from another source.")
@@ -387,6 +481,8 @@ def analyze_prices(closes: list[float] | None = None, dates: list[str] | None = 
     except ValueError as exc:
         raise ArgError(str(exc)) from None
     out["source"] = source
+    if scripcode:
+        out["session"] = session
     out["definitions"] = analysis.TECHNICAL_DEFINITIONS
     out["note"] = ("Indicators describe past prices; they are not forecasts or advice. "
                    "Further reading: Zerodha Varsity, Technical Analysis https://zerodha.com/varsity/module/technical-analysis/")
@@ -408,3 +504,41 @@ def position_size(capital: float, entry: float, stop: float | None = None, side:
         raise ArgError(str(exc)) from None
     out["note"] = "Arithmetic on the inputs given, not a recommendation to trade."
     return out
+
+
+# ---------------------------------------------------------------- journal
+def record_analysis(scripcode: str, skill: str, action: str, entry: float | None = None, stop: float | None = None,
+                    target: float | None = None, horizon_days: int = 20, confidence: float | None = None, rationale: str = "",
+                    model: str | None = None, nse_symbol: str | None = None) -> dict:
+    from . import journal
+
+    code = _code(scripcode)
+    action = str(action or "").strip().lower()
+    if action not in journal.ACTIONS:
+        raise ArgError(f"action must be one of {', '.join(journal.ACTIONS)} (sell = bearish: short, or exit a long)")
+    skill = str(skill or "").strip()
+    if not skill:
+        raise ArgError("skill: the skill that produced this verdict, e.g. 'bse-mcp-trading-toolkit'")
+    horizon = int(horizon_days)
+    if not 1 <= horizon <= 250:
+        raise ArgError("horizon_days: trading days to judge the call over, 1-250 (20 is about a month)")
+    if confidence is not None and not 0 <= confidence <= 1:
+        raise ArgError("confidence is a fraction between 0 and 1")
+    quote = get_quote(code)
+    price = entry if entry is not None else quote["price"]["ltp"]
+    if not price or price <= 0:
+        raise ArgError("no entry given and BSE has no price for this scrip")
+    side = journal.ACTIONS[action]
+    if side:  # buy: stop below, target above the entry; sell: the other way round
+        if stop is not None and side * (price - stop) <= 0:
+            raise ArgError(f"for a {action} the stop must be {'below' if side > 0 else 'above'} the entry ({price})")
+        if target is not None and side * (target - price) <= 0:
+            raise ArgError(f"for a {action} the target must be {'above' if side > 0 else 'below'} the entry ({price})")
+    now = _now()
+    with journal.connect() as conn:
+        vid = journal.record(conn, scripcode=code, skill=skill, action=action, entry=price, quote=quote, now=now, stop=stop, target=target,
+                             horizon_days=horizon, confidence=confidence, rationale=str(rationale or ""), model=model,
+                             nse_symbol=(nse_symbol or "").strip().upper() or None)
+    return {"id": vid, "journal": str(journal.db_path()), "scripcode": code, "skill": skill, "action": action, "entry": price,
+            "stop": stop, "target": target, "horizon_days": horizon, "session": quote["session"],
+            "note": f"Scored by `bse-mcp score` once {horizon} trading days have closed after today, against NSE daily candles."}

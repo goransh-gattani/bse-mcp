@@ -7,7 +7,7 @@ from bse_mcp import server as S
 
 EXPECTED = ["search_scrips", "get_quote", "get_market_depth", "get_peers", "get_price_history", "get_financials",
             "get_announcements", "download_announcement_pdf", "list_scrips", "call_bse_api",
-            "analyze_fundamentals", "analyze_prices", "position_size"]
+            "analyze_fundamentals", "analyze_prices", "position_size", "get_session_status", "record_analysis"]
 
 
 def run(coro):

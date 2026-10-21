@@ -209,3 +209,35 @@ def test_since_entry_trailing_levels():
         A.technicals(c, days, h, l, entry_date="2026-04-15")
     short = A.technicals(c, days, h, l, entry_date="2026-03-11", side="short")["since_entry"]
     assert short["lowest_close"] == 110.0 and short["atr_trail"]["2x"] == round(110 + 2 * a14, 2)
+
+
+# SBI's Apr-Jun 2026 filing as BSE returned it on 21 Oct 2026 (Rs million; BSE's signs kept: sub-items and NPA/capital ratios negative).
+SBI_Q1FY27 = {"Interest Earned/Net Income from sales/services": 1278964.6, "Income on Investments": -295101.9, "Other Income": 159226.9,
+              "Total Income": 1438191.5, "Interest Expended": -809040.2, "Employee Cost": -174238.0, "Other operating expenses": -119621.5,
+              "Total Expenditure for Banks": -1102899.7, "Operating Profit Before Provisions and Contingencies": 335291.8,
+              "Provisions (other than tax) and Contingencies": -50467.7, "Profit (+)/ Loss (-) from Ordinary Activities before Tax": 284824.1,
+              "Tax": -73611.9, "Net Profit (+)/ Loss (-) from Ordinary Activities after Tax": 211212.2, "Net Profit": 211212.2,
+              "CET 1 Ratio": -12.89, "Basic EPS before Extraordinary items": 22.88, "Amount of Gross NPA": -742720.6,
+              "Amount of Net NPA": -191584.9, "% of Gross NPAs": -1.47, "% of Net NPAs": -0.38, "Return on Assets": 1.11}
+
+
+def test_bank_metrics_from_a_real_filing():
+    assert A.is_bank(SBI_Q1FY27) and not A.is_bank({"Net Sales/Revenue From Operations": 1.0})
+    m = A.bank_metrics(SBI_Q1FY27)
+    assert m["nii"] == pytest.approx(1278964.6 - 809040.2) and m["provisions"] == 50467.7
+    assert m["cost_to_income"] == pytest.approx(round(293859.5 / (469924.4 + 159226.9), 4))
+    assert m["gross_npa_pct"] == 1.47 and m["net_npa_pct"] == 0.38 and m["cet1_pct"] == 12.89  # signs fixed
+    assert m["npa_coverage"] == pytest.approx(round(1 - 191584.9 / 742720.6, 4)) and m["eps"] == 22.88
+
+
+def test_fundamentals_switches_to_bank_metrics():
+    ends = ["30-Jun-26", "31-Mar-26", "31-Dec-25", "30-Sep-25", "30-Jun-25"]
+    qs = [{"quarter": f"q{i}", "period": f"p{i}", "period_end": e,
+           "lines": {k: v * (1 - 0.02 * i) if isinstance(v, float) else v for k, v in SBI_Q1FY27.items()}} for i, e in enumerate(ends)]
+    out = A.fundamentals(qs)
+    assert out["kind"] == "bank" and "ebitda" not in out["quarters"][0]["metrics"]
+    assert out["quarters"][0]["yoy"]["nii"] == pytest.approx(round(1 / 0.92 - 1, 4))
+    assert "cost_to_income_change_pts" in out["quarters"][0]["qoq"]
+    assert out["ttm"]["available"] and out["ttm"]["eps"] == pytest.approx(round(22.88 * (1 + 0.98 + 0.96 + 0.94), 2))
+    assert "nii" in A.definitions_for("bank") and "ebitda" not in A.definitions_for("bank")
+    assert A.fundamentals([{**qs[0], "lines": {"Net Sales/Revenue From Operations": 10.0}}])["kind"] == "company"

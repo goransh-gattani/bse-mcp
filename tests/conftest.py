@@ -56,4 +56,11 @@ def fake(monkeypatch):
     f = FakeBse()
     monkeypatch.setattr(bse, "fetch", f)
     monkeypatch.setattr(tools, "_today", lambda: __import__("datetime").date(2026, 10, 19))
+    monkeypatch.setattr(tools, "_now", lambda: __import__("datetime").datetime(2026, 10, 19, 12, 0, tzinfo=tools.IST))
     return f
+
+
+@pytest.fixture(autouse=True)
+def journal_in_tmp(tmp_path, monkeypatch):
+    """No test writes to the real journal in ~/.bse-mcp."""
+    monkeypatch.setenv("BSE_MCP_JOURNAL", str(tmp_path / "journal.db"))

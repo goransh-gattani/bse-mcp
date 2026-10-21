@@ -57,6 +57,11 @@ tools.search_scrips.__doc__ = ("Find BSE scrip codes by company name, symbol, IS
 tools.get_quote.__doc__ = ("Live price and key facts for one BSE scrip: LTP, change, day/52-week range, volume, delivery %, "
                            "market cap, EPS/PE/PB/ROE/margins (standalone and consolidated), group, sector/industry, ISIN, "
                            "flags (ASM/GSM etc.). scripcode: the 5-6 digit BSE code.")
+tools.get_session_status.__doc__ = ("Whether a BSE scrip's price is from today's session. BSE returns a last price for every scrip at all "
+                                    "times (after hours, holidays, suspended scrips), so this compares the price's own timestamp with today "
+                                    "in IST. status: live, closed_after_session, pre_open, awaiting_open, market_closed (nothing traded "
+                                    "today), stock_not_trading (the market traded but this scrip didn't), or unknown. data_as_of is the "
+                                    "price's timestamp. get_quote, analyze_fundamentals and analyze_prices(scripcode) include the same block.")
 tools.get_market_depth.__doc__ = "Top-5 bids and asks (price and quantity) with totals for one BSE scrip."
 tools.get_peers.__doc__ = ("BSE's peer group for a scrip: each peer's code, LTP, change %, PE, PB, EPS, revenue and PAT "
                            "(Rs Cr), OPM, NPM, 52-week range and the quarter those results are from.")
@@ -87,7 +92,9 @@ tools.analyze_fundamentals.__doc__ = ("Computed fundamentals for a BSE scrip fro
                                       "with YoY and QoQ growth (matched by period, not by position), margins and margin change, cost "
                                       "structure as % of revenue, interest coverage, tax rate, other income as % of PBT, TTM totals and "
                                       "TTM growth, and TTM P/E and price/sales from the live price. quarters: how many to fetch "
-                                      "(8 gives TTM and its growth). Use this instead of doing the arithmetic yourself.")
+                                      "(8 gives TTM and its growth). Banks file a different format, so for them (kind='bank') you get NII, PPOP, "
+                                      "cost-to-income, provisions, gross/net NPA %, NPA coverage, RoA and CET1 instead of EBITDA and cost "
+                                      "structure. Use this instead of doing the arithmetic yourself.")
 tools.analyze_prices.__doc__ = ("Technical indicators on daily prices. Either pass scripcode to use BSE's daily closes and volumes for "
                                 "the last 12 months, or pass your own daily series oldest first (e.g. candles from NSE's price-history "
                                 "MCP server): closes, plus dates, highs, lows, volumes. Gives returns, CAGR, volatility, max drawdown, "
@@ -105,9 +112,16 @@ tools.position_size.__doc__ = ("Position size, risk/reward and Indian trading co
                                "which limit decided them, loss at stop and gain at target net of STT, exchange, SEBI, stamp duty, "
                                "brokerage and GST, net reward:risk, breakeven move and Kelly fractions.")
 
+tools.record_analysis.__doc__ = ("Record a skill's verdict on a stock in the local journal (SQLite), so the skills can later be judged on "
+                                 "what the price did next. Call it once per verdict, at the end of an analysis. skill: the skill's name "
+                                 "(e.g. 'bse-mcp-trading-toolkit'). action: buy, sell (bearish: short, or exit a long), hold or avoid. "
+                                 "entry defaults to the live price; stop and target are prices; horizon_days: trading days to judge "
+                                 "the call over (default 20). confidence 0-1, a one-line rationale, and model (your model name) if known. "
+                                 "nse_symbol when it differs from BSE's symbol. The live price and session status are saved with it.")
+
 for _fn in (tools.search_scrips, tools.get_quote, tools.get_market_depth, tools.get_peers, tools.get_price_history, tools.get_financials,
             tools.get_announcements, tools.download_announcement_pdf, tools.list_scrips, tools.call_bse_api,
-            tools.analyze_fundamentals, tools.analyze_prices, tools.position_size):
+            tools.analyze_fundamentals, tools.analyze_prices, tools.position_size, tools.get_session_status, tools.record_analysis):
     _tool(_fn)
 
 
@@ -121,6 +135,13 @@ def main(argv: list[str] | None = None) -> int:
     setup.add_argument("--no-desktop", action="store_true", help="don't touch the Claude Desktop config")
     setup.add_argument("--no-code", action="store_true", help="don't touch Claude Code (no server registration, no skills)")
     setup.add_argument("--no-skills", action="store_true", help="don't install the trading skills into Claude Code")
+    snap = sub.add_parser("snapshot", help="journal: record quote and price analysis for a watchlist, plus NSE daily candles")
+    snap.add_argument("scrips", nargs="*", help="scrip codes, optionally CODE:NSESYMBOL (default: the watchlist file)")
+    snap.add_argument("--watchlist", help="file of 'scripcode [NSE symbol]' lines (default ~/.bse-mcp/watchlist.txt)")
+    snap.add_argument("--no-candles", action="store_true", help="skip fetching NSE candles")
+    score = sub.add_parser("score", help="journal: score recorded verdicts whose horizon has passed, against NSE daily candles")
+    score.add_argument("--no-fetch", action="store_true", help="use only candles already in the journal")
+    sub.add_parser("report", help="journal: how each skill's scored verdicts did")
     args = parser.parse_args(argv)
     if args.diag:
         print(bse.diagnose())
@@ -134,7 +155,36 @@ def main(argv: list[str] | None = None) -> int:
             print(f"bse-mcp setup: {exc}", file=sys.stderr)
             return 1
         return 0
+    if args.cmd in ("snapshot", "score", "report"):
+        return _journal(args)
     server.run()
+    return 0
+
+
+def _journal(args) -> int:
+    from pathlib import Path
+
+    from . import journal, nse
+
+    history = None if getattr(args, "no_candles", False) or getattr(args, "no_fetch", False) else nse.stock_history
+    now = tools._now()
+    with journal.connect() as conn:
+        if args.cmd == "snapshot":
+            if args.scrips:
+                watch = [(c.split(":")[0], (c.split(":") + [None])[1]) for c in args.scrips]
+            else:
+                path = Path(args.watchlist or Path.home() / ".bse-mcp" / "watchlist.txt").expanduser()
+                if not path.is_file():
+                    print(f"bse-mcp snapshot: no scrips given and no watchlist at {path} (lines of 'scripcode [NSE symbol]')", file=sys.stderr)
+                    return 1
+                watch = journal.read_watchlist(path)
+            lines = journal.snapshot(conn, watch, now, tools.get_quote, lambda c: tools.analyze_prices(scripcode=c), history)
+        elif args.cmd == "score":
+            lines = journal.score(conn, now, history) or ["nothing to score"]
+        else:
+            lines = journal.format_report(journal.report(conn))
+    print(f"journal: {journal.db_path()}")
+    print("\n".join(lines))
     return 0
 
 

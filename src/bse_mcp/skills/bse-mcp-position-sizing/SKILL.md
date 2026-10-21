@@ -11,6 +11,10 @@ Position sizing is how you survive. The goal: risk a small, consistent percentag
 
 Compute every size with `position_size` (bse-mcp) rather than by hand. It applies the methods below, caps the result by capital (with leverage) and the single-stock limit, says which limit decided the size, and nets out Indian trading costs. These tools are read-only and never place orders.
 
+Say how fresh the price is. BSE quotes every scrip at all times, including after hours, on holidays and for suspended scrips, so `get_quote`, `analyze_prices` with `scripcode` and `analyze_fundamentals` return a `session` block (`get_session_status` gives it alone). Name the time the numbers are from (`data_as_of`). `live`: today's candle is still forming and the indicators run to the previous close. `closed_after_session`: today's close. `pre_open`, `awaiting_open` or `market_closed`: the price is the last close, not live; say so. `stock_not_trading`: the market traded today but this scrip didn't (suspended, halted or no trades); don't present its price as tradable. `unknown`: treat the price as possibly stale.
+
+When you give a verdict on a stock (buy, sell, hold or avoid), record it with `record_analysis`: `skill` is this skill's name (`bse-mcp-position-sizing`), with the entry, stop and target you proposed and the number of trading days the call is for (`horizon_days`). The journal is how these skills get judged against what the price did next, so record the call as you stated it, once.
+
 1. **Account size**: total trading capital (ask the user if not known)
 2. **Current price**: `get_quote`, or user-provided
 3. **ATR(14)**: `analyze_prices` on 60+ daily candles with highs and lows (e.g. from NSE's `nse-bhavcopy` MCP server). BSE's daily closes alone don't give ATR: without candles, size from a structure stop at a recent swing low (`swings`) instead.

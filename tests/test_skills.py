@@ -36,7 +36,7 @@ def test_skill_fits_claude_code_and_the_claude_app(skill):
 @pytest.mark.parametrize("skill", SKILLS)
 def test_skill_points_only_at_real_tools_and_skills(skill):
     text = (skill / "SKILL.md").read_text(encoding="utf-8")
-    tools = set(re.findall(r"`((?:get|search|list|analyze|download|call)_[a-z_]+|position_size)", text))
+    tools = set(re.findall(r"`((?:get|search|list|analyze|download|call|record)_[a-z_]+|position_size)", text))
     assert tools and tools <= set(TOOL_NAMES), tools - set(TOOL_NAMES)
     assert set(re.findall(r"\bbse-mcp-[a-z-]*[a-z]\b", text)) <= set(NAMES)
 

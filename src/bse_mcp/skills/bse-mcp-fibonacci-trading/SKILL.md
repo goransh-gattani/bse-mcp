@@ -15,6 +15,7 @@ These skills run on bse-mcp's read-only tools and never place orders. Take indic
 |------|------|
 | Scrip code from a company name | `search_scrips` |
 | Live price, day and 52-week range | `get_quote` |
+| Is the price from today's session? | `session` in `get_quote` / `analyze_prices` / `analyze_fundamentals`, or `get_session_status` |
 | Indicators on the last 12 months of daily closes | `analyze_prices` with `scripcode`: it fetches BSE's daily closes and volumes itself |
 | ATR, ADX, stochastic, chandelier, pivots, high/low swings, or more than a year of history | daily candles passed to `analyze_prices` as `dates`, `closes`, `highs`, `lows`, `volumes`, oldest first |
 | Weekly bars | `analyze_prices` with `timeframe="weekly"` |
@@ -23,6 +24,10 @@ These skills run on bse-mcp's read-only tools and never place orders. Take indic
 For daily candles, use NSE's `nse-bhavcopy` MCP server if it's connected (`https://mcp.nseindia.in/bhavcopy/cm/mcp`, no sign-in, about 5 years of end-of-day data by NSE symbol); if a call returns only part of the range, page back until you have 260+ bars. If it isn't connected, work from BSE's closes and tell the user which levels needed highs and lows; they can connect NSE's server or paste candles (a CSV is fine). Never make prices up.
 
 Exchange price histories may not be adjusted for splits and bonuses (NSE's bhavcopy isn't). If `analyze_prices` reports `price_jumps`, check the announcements (`get_announcements`) for a split or bonus before trusting any level that spans the jump.
+
+Say how fresh the price is. BSE quotes every scrip at all times, including after hours, on holidays and for suspended scrips, so `get_quote`, `analyze_prices` with `scripcode` and `analyze_fundamentals` return a `session` block (`get_session_status` gives it alone). Name the time the numbers are from (`data_as_of`). `live`: today's candle is still forming and the indicators run to the previous close. `closed_after_session`: today's close. `pre_open`, `awaiting_open` or `market_closed`: the price is the last close, not live; say so. `stock_not_trading`: the market traded today but this scrip didn't (suspended, halted or no trades); don't present its price as tradable. `unknown`: treat the price as possibly stale.
+
+When you give a verdict on a stock (buy, sell, hold or avoid), record it with `record_analysis`: `skill` is this skill's name (`bse-mcp-fibonacci-trading`), with the entry, stop and target you proposed and the number of trading days the call is for (`horizon_days`). The journal is how these skills get judged against what the price did next, so record the call as you stated it, once.
 
 For this skill: `analyze_prices` returns `fibonacci` from the highest high and lowest low of the last 126 daily bars (52 weekly; closes when no highs and lows are given): the move's direction and swing points, the 23.6-78.6% retracements, extensions measured from the start of the move, and, once a pullback has begun, `pullback.projections`: point C + the move x 100/127.2/161.8/200%, the convention below. For a different swing, take its high and low from `swings` or the user: retracement level = high - (high - low) x ratio.
 
